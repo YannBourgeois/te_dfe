@@ -1,0 +1,195 @@
+// te_dfe_burst.slim — pass 2, rate-driven mutations + single burst
+//
+// SLiM generates m1 mutations natively at a per-bp per-generation rate
+// that is LAMBDA baseline, multiplied by MULTIPLIER during the burst
+// interval [BURST_TICK_START, BURST_TICK_END).
+//
+// Per-mutation selection coefficients are drawn from the DFE mixture
+// (pi_neutral + gamma) in a late() callback, applied to mutations whose
+// originTick == sim.cycle.
+
+initialize() {
+    initializeTreeSeq(retainCoalescentOnly=F);
+
+    // ---- SLiM rescaling factor Q -------------------------------------------
+    // Q is passed from Python (config SLIM_Q). With rescaling, population sizes
+    // and times are divided by Q while per-generation rates and selection are
+    // multiplied by Q, preserving 2*Ne*s, 2*Ne*mu and rho. SIM_END and the
+    // burst tick bounds are pre-scaled Python-side (they are parse-time loop
+    // bounds); everything read from files or used as a rate is scaled HERE so
+    // all scaling is localized. Q = 1 is exact (no-op).
+    // Multiply rates and selection by Q; divide Ne and generation times by Q.
+    defineConstant("SCALED_LAMBDA", LAMBDA * Q);
+    // The mutation rate is initialized below, AFTER the genomic-element setup,
+    // because the background-selection path needs a per-segment rate map.
+
+    // Variable recombination map (rates scaled by Q).
+    recomb_lines = readFile(RECOMB_PATH);
+    recomb_ends  = integer(0);
+    recomb_rates = float(0);
+    for (line in recomb_lines) {
+        if (line == "") next;
+        parts = strsplit(line, "\t");
+        recomb_ends  = c(recomb_ends,  asInteger(parts[0]));
+        recomb_rates = c(recomb_rates, asFloat(parts[1]) * Q);
+    }
+    initializeRecombinationRate(recomb_rates, recomb_ends - 1);
+
+    // TE mutation type m1 — selection coeff set per-mutation in late().
+    initializeMutationType("m1", 0.5, "f", 0.0);
+    initializeGenomicElementType("g1", m1, 1.0);
+
+    // ---- Background selection (optional, USE_BGS) --------------------------
+    // When on: deleterious mutations (m2, gamma DFE) tile the coding intervals
+    // (g2); TE insertions (m1) tile the non-coding remainder (g1). When off:
+    // g1 (m1 only) tiles the whole sequence, exactly as the original model.
+    // CODING_SEG_ENDS / CODING_SEG_IS_CODING describe the per-segment structure
+    // used by the per-tick mutation-rate map (built in the early() event).
+    if (USE_BGS == 1) {
+        // Deleterious DFE as a built-in gamma (mean scaled by Q like all s).
+        initializeMutationType("m2", DEL_DOMINANCE, "g",
+                               -1.0 * DEL_MEAN_S * Q, DEL_SHAPE);
+        initializeGenomicElementType("g2", m2, 1.0);
+
+        // Read coding intervals (window-relative start<TAB>end, half-open).
+        coding_lines = readFile(CODING_PATH);
+        c_starts = integer(0);
+        c_ends   = integer(0);
+        for (line in coding_lines) {
+            if (line == "") next;
+            parts = strsplit(line, "\t");
+            a = asInteger(parts[0]);
+            b = asInteger(parts[1]);
+            if (b > a) { c_starts = c(c_starts, a); c_ends = c(c_ends, b); }
+        }
+        L = asInteger(SEQ_LEN);
+        // Tile the genome: alternate non-coding (g1) and coding (g2) elements,
+        // and record segment boundaries + a coding flag for the rate map.
+        seg_ends   = integer(0);
+        seg_coding = integer(0);
+        cursor = 0;
+        for (k in seqLen(size(c_starts))) {
+            cs = c_starts[k]; ce = c_ends[k];
+            if (cs > cursor) {
+                initializeGenomicElement(g1, cursor, cs - 1);
+                seg_ends = c(seg_ends, cs - 1); seg_coding = c(seg_coding, 0);
+            }
+            ce = min(ce, L);
+            if (ce > cs) {
+                initializeGenomicElement(g2, cs, ce - 1);
+                seg_ends = c(seg_ends, ce - 1); seg_coding = c(seg_coding, 1);
+                cursor = ce;
+            }
+        }
+        if (cursor < L) {
+            initializeGenomicElement(g1, cursor, L - 1);
+            seg_ends = c(seg_ends, L - 1); seg_coding = c(seg_coding, 0);
+        }
+        defineConstant("SEG_ENDS",   seg_ends);
+        defineConstant("SEG_CODING", seg_coding);
+        defineConstant("SCALED_DEL_MU", DEL_MU * Q);
+        // Initial rate map: non-coding = SCALED_LAMBDA, coding = SCALED_DEL_MU.
+        init_rates = ifelse(seg_coding == 1,
+                            rep(SCALED_DEL_MU, size(seg_coding)),
+                            rep(SCALED_LAMBDA, size(seg_coding)));
+        initializeMutationRate(init_rates, SEG_ENDS);
+    } else {
+        initializeGenomicElement(g1, 0, asInteger(SEQ_LEN) - 1);
+        initializeMutationRate(SCALED_LAMBDA);
+    }
+
+    // Demographic schedule. Generation times and Ne both divided by Q
+    // (clamped to >= 1 so rescaling never produces an empty population or a
+    // zero generation index).
+    demog_lines = readFile(DEMOG_PATH);
+    demog_gens  = integer(0);
+    demog_nes   = integer(0);
+    for (line in demog_lines) {
+        if (line == "") next;
+        parts = strsplit(line, "\t");
+        g = asInteger(round(asFloat(parts[0]) / Q));
+        n = asInteger(round(asFloat(parts[1]) / Q));
+        demog_gens = c(demog_gens, max(1, g));
+        demog_nes  = c(demog_nes,  max(1, n));
+    }
+    defineConstant("DEMOG_GENS", demog_gens);
+    defineConstant("DEMOG_NES",  demog_nes);
+
+    catn("=== Parameters ===");
+    catn("Q (rescaling)    = " + Q);
+    catn("SEQ_LEN          = " + SEQ_LEN);
+    catn("SIM_END (scaled) = " + SIM_END);
+    catn("LAMBDA (bio)     = " + LAMBDA);
+    catn("LAMBDA (scaled)  = " + SCALED_LAMBDA);
+    catn("GAMMA_SHAPE      = " + GAMMA_SHAPE);
+    catn("MEAN_S (bio)     = " + MEAN_S);
+    catn("MEAN_S (scaled)  = " + (MEAN_S * Q));
+    catn("BURST_TICK_START = " + BURST_TICK_START);
+    catn("BURST_TICK_END   = " + BURST_TICK_END);
+    catn("MULTIPLIER       = " + MULTIPLIER);
+    catn("==================");
+}
+
+// Helper: draw one selection coefficient from the pure-gamma DFE.
+// SLiM's rgamma(n, mean, shape) — first arg is mean, second is shape.
+// Mean |s| is scaled by Q (selection coefficients scale with rescaling so that
+// 2*Ne_scaled*s_scaled = 2*Ne*s is preserved). Shape is scale-invariant.
+function (float)drawDFE(void) {
+    return -rgamma(1, MEAN_S * Q, GAMMA_SHAPE);
+}
+
+// Tick 1: create the subpopulation. This must happen in early() because
+// first() runs before subpopulations exist. All blocks that reference
+// p1 must be in early() or later.
+1 early() {
+    initial_ne = DEMOG_NES[0];
+    sim.addSubpop("p1", initial_ne);
+}
+
+// Per-tick events run in early() (after offspring generation). The
+// mutation-rate update applied here takes effect for the NEXT tick's
+// offspring draw, which means the burst is shifted by one tick relative
+// to the requested interval — biologically negligible.
+//
+// We do not use first() because (a) it runs before p1 exists on tick 1,
+// and (b) we no longer call addNewDrawnMutation (the original reason for
+// preferring first()'s pre-offspring timing).
+
+1:SIM_END early() {
+    // Demographic schedule
+    idx = which(DEMOG_GENS == sim.cycle);
+    if (size(idx) > 0) {
+        p1.setSubpopulationSize(DEMOG_NES[idx[0]]);
+    }
+
+    // Burst rate modulation. The TE rate is SCALED_LAMBDA, multiplied by
+    // MULTIPLIER inside the burst interval (MULTIPLIER is a ratio, unaffected
+    // by rescaling). With background selection on, only the NON-CODING (TE)
+    // segments are modulated; coding segments stay at the constant deleterious
+    // rate, so the two mutation processes remain independent.
+    in_burst = (sim.cycle >= BURST_TICK_START) & (sim.cycle < BURST_TICK_END);
+    te_rate = in_burst ? (SCALED_LAMBDA * MULTIPLIER) else SCALED_LAMBDA;
+    if (USE_BGS == 1) {
+        rates = ifelse(SEG_CODING == 1,
+                       rep(SCALED_DEL_MU, size(SEG_CODING)),
+                       rep(te_rate, size(SEG_CODING)));
+        sim.chromosome.setMutationRate(rates, SEG_ENDS);
+    } else {
+        sim.chromosome.setMutationRate(te_rate);
+    }
+}
+
+// Per-mutation DFE: at the end of each tick, find mutations that
+// originated this tick and draw a fresh s for each one.
+1:SIM_END late() {
+    new_muts = sim.mutationsOfType(m1);
+    new_muts = new_muts[new_muts.originTick == sim.cycle];
+    if (size(new_muts) == 0) return;
+    for (mut in new_muts) {
+        mut.setSelectionCoeff(drawDFE());
+    }
+}
+
+SIM_END late() {
+    sim.treeSeqOutput(OUTPUT_PATH);
+}

@@ -1,0 +1,204 @@
+// te_dfe_burst_context.slim — context-aware DFE + insertion preference,
+// now with an optional background-selection (BGS) path.
+//
+// Per-position insertion rate (from gamma_d, gamma_r and per-bin features)
+// and per-mutation TE selection coefficient (from alpha_d, alpha_r and
+// per-bin features). Both depend on:
+//   feature_d : log10(distance-to-nearest-gene) / log10(DIST_NORM)
+//   feature_r : log10(local_recomb_rate)        / log10(RECOMB_NORM)
+//
+// Background selection (USE_BGS == 1): deleterious mutations (m2, gamma DFE)
+// tile the CODING segments (g2); TE insertions (m1) tile the NON-CODING
+// remainder (g1). Because the TE rate varies per bin, Python pre-merges the
+// bin grid with the coding intervals and hands SLiM a per-segment table
+//   SEG_PATH rows:  seg_end_inclusive <TAB> is_coding(0/1) <TAB> te_rate
+// so SLiM only has to tile elements and set a piecewise rate map. When
+// USE_BGS == 0 the original per-bin (TE-only) path runs unchanged.
+//
+// NOTE: unlike te_dfe_burst.slim this model runs UNSCALED (no Q); SIM_END and
+// the burst tick bounds arrive already in simulation-tick units.
+
+initialize() {
+    initializeTreeSeq(retainCoalescentOnly=F);
+
+    // Per-bin context features and lambda_local — always read (the s-local
+    // lookup is bin-based regardless of BGS; lambda_local feeds the non-BGS
+    // rate map).
+    feature_lines = readFile(FEATURE_PATH);
+    bin_starts   = integer(0);
+    feature_d_arr = float(0);
+    feature_r_arr = float(0);
+    lambda_local_arr = float(0);
+    for (line in feature_lines) {
+        if (line == "") next;
+        parts = strsplit(line, "\t");
+        bin_starts       = c(bin_starts,       asInteger(parts[0]));
+        feature_d_arr    = c(feature_d_arr,    asFloat(parts[1]));
+        feature_r_arr    = c(feature_r_arr,    asFloat(parts[2]));
+        lambda_local_arr = c(lambda_local_arr, asFloat(parts[3]));
+    }
+    defineConstant("BIN_STARTS",   bin_starts);
+    defineConstant("FEATURE_D",    feature_d_arr);
+    defineConstant("FEATURE_R",    feature_r_arr);
+    defineConstant("LAMBDA_LOCAL", lambda_local_arr);
+    defineConstant("BIN_WIDTH",    asInteger(BIN_WIDTH_BP));
+
+    // Variable recombination map.
+    recomb_lines = readFile(RECOMB_PATH);
+    recomb_ends  = integer(0);
+    recomb_rates = float(0);
+    for (line in recomb_lines) {
+        if (line == "") next;
+        parts = strsplit(line, "\t");
+        recomb_ends  = c(recomb_ends,  asInteger(parts[0]));
+        recomb_rates = c(recomb_rates, asFloat(parts[1]));
+    }
+    initializeRecombinationRate(recomb_rates, recomb_ends - 1);
+
+    // TE mutation type m1 — selection coeff set per-mutation in late().
+    initializeMutationType("m1", 0.5, "f", 0.0);
+    initializeGenomicElementType("g1", m1, 1.0);
+
+    if (USE_BGS == 1) {
+        // Deleterious DFE as a built-in gamma (mean |s| = DEL_MEAN_S). No Q
+        // rescaling in the context model, so the mean is used directly.
+        initializeMutationType("m2", DEL_DOMINANCE, "g",
+                               -1.0 * DEL_MEAN_S, DEL_SHAPE);
+        initializeGenomicElementType("g2", m2, 1.0);
+
+        // Pre-merged per-segment table from Python (bin grid INTERSECTED with
+        // coding intervals): seg_end_inclusive, is_coding, te_rate.
+        seg_lines  = readFile(SEG_PATH);
+        seg_ends   = integer(0);
+        seg_coding = integer(0);
+        seg_rate   = float(0);
+        for (line in seg_lines) {
+            if (line == "") next;
+            parts = strsplit(line, "\t");
+            seg_ends   = c(seg_ends,   asInteger(parts[0]));
+            seg_coding = c(seg_coding, asInteger(parts[1]));
+            seg_rate   = c(seg_rate,   asFloat(parts[2]));
+        }
+        defineConstant("SEG_ENDS",   seg_ends);
+        defineConstant("SEG_CODING", seg_coding);
+        defineConstant("SEG_RATE",   seg_rate);
+
+        // Tile genomic elements: g2 on coding segments, g1 on non-coding.
+        start = 0;
+        for (k in seqLen(size(seg_ends))) {
+            e = seg_ends[k];
+            if (seg_coding[k] == 1)
+                initializeGenomicElement(g2, start, e);
+            else
+                initializeGenomicElement(g1, start, e);
+            start = e + 1;
+        }
+        // Initial rate map: coding = DEL_MU, non-coding = per-segment te_rate.
+        init_rates = ifelse(seg_coding == 1,
+                            rep(DEL_MU, size(seg_coding)),
+                            seg_rate);
+        initializeMutationRate(init_rates, seg_ends);
+    } else {
+        // Original TE-only path: g1 over the whole sequence, per-bin lambda.
+        initializeGenomicElement(g1, 0, asInteger(SEQ_LEN) - 1);
+        bin_ends = c(BIN_STARTS[1:(size(BIN_STARTS)-1)],
+                      asInteger(SEQ_LEN)) - 1;
+        initializeMutationRate(LAMBDA_LOCAL, bin_ends);
+    }
+
+    // Demographic schedule.
+    demog_lines = readFile(DEMOG_PATH);
+    demog_gens  = integer(0);
+    demog_nes   = integer(0);
+    for (line in demog_lines) {
+        if (line == "") next;
+        parts = strsplit(line, "\t");
+        demog_gens = c(demog_gens, asInteger(parts[0]));
+        demog_nes  = c(demog_nes,  asInteger(parts[1]));
+    }
+    defineConstant("DEMOG_GENS", demog_gens);
+    defineConstant("DEMOG_NES",  demog_nes);
+
+    catn("=== Parameters (context) ===");
+    catn("SEQ_LEN          = " + SEQ_LEN);
+    catn("SIM_END          = " + SIM_END);
+    catn("LAMBDA_GLOBAL    = " + LAMBDA_GLOBAL);
+    catn("S_GLOBAL         = " + S_GLOBAL);
+    catn("ALPHA_D          = " + ALPHA_D);
+    catn("ALPHA_R          = " + ALPHA_R);
+    catn("GAMMA_D          = " + GAMMA_D);
+    catn("GAMMA_R          = " + GAMMA_R);
+    catn("USE_BGS          = " + USE_BGS);
+    if (USE_BGS == 1) {
+        catn("DEL_MEAN_S       = " + DEL_MEAN_S);
+        catn("DEL_SHAPE        = " + DEL_SHAPE);
+        catn("DEL_MU           = " + DEL_MU);
+        catn("N_SEGMENTS       = " + size(SEG_ENDS));
+    }
+    catn("N_BINS           = " + size(BIN_STARTS));
+    catn("BIN_WIDTH_BP     = " + BIN_WIDTH);
+    catn("BURST_TICK_START = " + BURST_TICK_START);
+    catn("BURST_TICK_END   = " + BURST_TICK_END);
+    catn("MULTIPLIER       = " + MULTIPLIER);
+    catn("==================");
+}
+
+// Helper: for a given position, return s_local (positive; caller negates).
+function (float)sLocalAtPosition(integer pos) {
+    bin_idx = asInteger(pos / BIN_WIDTH);
+    if (bin_idx >= size(FEATURE_D)) bin_idx = size(FEATURE_D) - 1;
+    if (bin_idx < 0) bin_idx = 0;
+    fd = FEATURE_D[bin_idx];
+    fr = FEATURE_R[bin_idx];
+    log_s = log(S_GLOBAL) + ALPHA_D * fd + ALPHA_R * fr;
+    return exp(log_s);
+}
+
+// Tick 1: create the subpopulation.
+1 early() {
+    initial_ne = DEMOG_NES[0];
+    sim.addSubpop("p1", initial_ne);
+}
+
+1:SIM_END early() {
+    // Demographic schedule.
+    idx = which(DEMOG_GENS == sim.cycle);
+    if (size(idx) > 0) {
+        p1.setSubpopulationSize(DEMOG_NES[idx[0]]);
+    }
+
+    // Burst rate modulation. Inside [BURST_TICK_START, BURST_TICK_END) the TE
+    // (non-coding) rate is multiplied by MULTIPLIER. With BGS on, only the
+    // non-coding segments are modulated; coding stays at the constant
+    // deleterious rate so the two mutation processes remain independent.
+    in_burst = (sim.cycle >= BURST_TICK_START) & (sim.cycle < BURST_TICK_END);
+    mult_now = in_burst ? MULTIPLIER else 1.0;
+    if (USE_BGS == 1) {
+        rates = ifelse(SEG_CODING == 1,
+                       rep(DEL_MU, size(SEG_CODING)),
+                       SEG_RATE * mult_now);
+        sim.chromosome.setMutationRate(rates, SEG_ENDS);
+    } else {
+        current_rates = LAMBDA_LOCAL * mult_now;
+        bin_ends = c(BIN_STARTS[1:(size(BIN_STARTS)-1)],
+                      asInteger(SEQ_LEN)) - 1;
+        sim.chromosome.setMutationRate(current_rates, bin_ends);
+    }
+}
+
+// Per-mutation DFE: assign each TE (m1) that originated this tick a selection
+// coefficient from the context regression at its position. Deleterious m2
+// mutations get their s natively from the gamma DFE and are left untouched.
+1:SIM_END late() {
+    new_muts = sim.mutationsOfType(m1);
+    new_muts = new_muts[new_muts.originTick == sim.cycle];
+    if (size(new_muts) == 0) return;
+    for (mut in new_muts) {
+        s_local = sLocalAtPosition(mut.position);
+        mut.setSelectionCoeff(-s_local);
+    }
+}
+
+SIM_END late() {
+    sim.treeSeqOutput(OUTPUT_PATH);
+}

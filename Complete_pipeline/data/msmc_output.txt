@@ -1,0 +1,2 @@
+time_index	left_time_boundary	right_time_boundary	lambda
+0	0.0000000000e+00	1.0000000000e+00	8.0000000000e+03
