@@ -1,4 +1,6 @@
 # te_dfe, NPE package for TE DFE + burst inference
+[![FOSSA Status](https://app.fossa.com/api/projects/git%2Bgithub.com%2FYannBourgeois%2Fte_dfe.svg?type=shield)](https://app.fossa.com/projects/git%2Bgithub.com%2FYannBourgeois%2Fte_dfe?ref=badge_shield)
+
 
 Neural Posterior Estimation for transposable-element evolution from genotype
 data. Two models can be selected at runtime:
@@ -139,3 +141,7 @@ is used only when phased; unphased splits carriers at the individual level
 length is fixed across modes (the slot is reused), so the network shape is
 phasing-stable.
 
+
+
+## License
+[![FOSSA Status](https://app.fossa.com/api/projects/git%2Bgithub.com%2FYannBourgeois%2Fte_dfe.svg?type=large)](https://app.fossa.com/projects/git%2Bgithub.com%2FYannBourgeois%2Fte_dfe?ref=badge_large)
