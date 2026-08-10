@@ -70,7 +70,15 @@ MAX_TE="${MAX_TE:-}"                    # subsample, to match the network's budg
 FIX="${FIX:-}"                          # e.g. FIX="log_duration=2.3026" (repeatable)
 DIAGNOSTICS="${DIAGNOSTICS:-1}"         # 1 = write <sim>.sfs_fit.tsv/.png (obs vs fitted per age bin)
 BOOTSTRAP="${BOOTSTRAP:-100}"           # N Godambe bootstrap replicates; 0 = FIM only
-BOOT_BLOCK_COL="${BOOT_BLOCK_COL:-}"    # e.g. "window": resample blocks, not individual TEs
+BOOT_BLOCK_COL="${BOOT_BLOCK_COL:-window}"  # "window": resample linkage blocks, not individual TEs
+MODEL_KIND="${MODEL_KIND:-simple}"      # simple = fit_dfe_moments_aged.py; context = fit_dfe_moments_context.py
+RECOMB="${RECOMB:-auto}"                # "auto" finds <stem>_recomb.npz; "" to skip (context model NEEDS it)
+NEUTRAL="${NEUTRAL:-0}"                 # 1 = extract neutral SNPs and calibrate the fit on them
+NEUTRAL_CALIBRATION="${NEUTRAL_CALIBRATION:-full}"   # full | shape
+MAX_SNPS="${MAX_SNPS:-20000}"           # neutral SNPs kept per window
+AGE_ERROR_SIGMA="${AGE_ERROR_SIGMA:-0}" # model age-measurement error (0 = off)
+FIT_AGE_ERROR="${FIT_AGE_ERROR:-0}"     # 1 = ESTIMATE sigma instead of fixing it
+RECOMB_BINS="${RECOMB_BINS:-4}"         # context model: number of recombination bins
 WRITE_VCF="${WRITE_VCF:-0}"             # 1 = also emit a phased VCF for GEVA
 EXTRA="${EXTRA:-}"
 
@@ -83,8 +91,8 @@ source /shared/projects/datepalm/test_DFE_deeplearning/.venv/bin/activate
 source /shared/projects/datepalm/test_DFE_deeplearning/activate.sh
 export PYTHONPATH="/shared/projects/datepalm/test_DFE_deeplearning/popgen-npe:${PYTHONPATH:-}"
 
-export TE_DFE_MODEL=simple
-export MODEL=simple
+export TE_DFE_MODEL="${MODEL_KIND}"
+export MODEL="${MODEL_KIND}"
 
 cd "${REPO_DIR}"
 mkdir -p logs "${OUT_DIR}"
@@ -112,7 +120,12 @@ AGES="${OUT_DIR}/${BASE}.ages.tsv"
 REPORT="${OUT_DIR}/${BASE}.fit.txt"
 
 # --- step 1: exact ages out of the tree sequences ---------------------------
+SNPS="${OUT_DIR}/${BASE}.snps.tsv"
 EX_ARGS=(--trees "${TREES[@]}" --out "${AGES}")
+if [ -n "${RECOMB}" ];    then EX_ARGS+=(--recomb "${RECOMB}"); fi
+if [ "${NEUTRAL}" = "1" ]; then
+    EX_ARGS+=(--snps-out "${SNPS}" --max-snps-per-window "${MAX_SNPS}")
+fi
 if [ "${WRITE_VCF}" = "1" ]; then
     EX_ARGS+=(--vcf "${OUT_DIR}/${BASE}.vcf")
 fi
@@ -177,17 +190,39 @@ if [ -n "${FIX}" ]; then
 fi
 
 if [ "${DIAGNOSTICS}" = "1" ]; then FIT_ARGS+=(--diagnostics "${OUT_DIR}/${BASE}"); fi
-if [ "${BOOTSTRAP}" -gt 0 ] 2>/dev/null; then
-    FIT_ARGS+=(--uncerts-bootstrap "${BOOTSTRAP}")
-else
-    FIT_ARGS+=(--uncerts)
+# age-measurement-error model (shared by both fits)
+if [ "${AGE_ERROR_SIGMA}" != "0" ]; then FIT_ARGS+=(--age-error-sigma "${AGE_ERROR_SIGMA}"); fi
+if [ "${FIT_AGE_ERROR}" = "1" ];     then FIT_ARGS+=(--fit-age-error); fi
+# empirical neutral baseline (shared by both fits)
+if [ "${NEUTRAL}" = "1" ]; then
+    FIT_ARGS+=(--neutral-ages "${SNPS}" --neutral-calibration "${NEUTRAL_CALIBRATION}")
 fi
-if [ -n "${BOOT_BLOCK_COL}" ]; then FIT_ARGS+=(--boot-block-col "${BOOT_BLOCK_COL}"); fi
+
+if [ "${MODEL_KIND}" = "context" ]; then
+    FIT_SCRIPT=fit_dfe_moments_context.py
+    export TE_DFE_MODEL=context MODEL=context
+    FIT_ARGS+=(--recomb-bins "${RECOMB_BINS}")
+    if [ "${BOOTSTRAP}" -gt 0 ] 2>/dev/null; then
+        FIT_ARGS+=(--uncerts-bootstrap-refit "${BOOTSTRAP}")
+    else
+        FIT_ARGS+=(--uncerts)
+    fi
+    if [ -n "${BOOT_BLOCK_COL}" ]; then FIT_ARGS+=(--boot-block-col "${BOOT_BLOCK_COL}"); fi
+else
+    FIT_SCRIPT=fit_dfe_moments_aged.py
+    if [ "${BOOTSTRAP}" -gt 0 ] 2>/dev/null; then
+        FIT_ARGS+=(--uncerts-bootstrap-refit "${BOOTSTRAP}")
+    else
+        FIT_ARGS+=(--uncerts)
+    fi
+    if [ -n "${BOOT_BLOCK_COL}" ]; then FIT_ARGS+=(--boot-block-col "${BOOT_BLOCK_COL}"); fi
+fi
+echo "[aged] model=${MODEL_KIND} script=${FIT_SCRIPT}"
 
 # Run the fit WITHOUT letting a non-zero exit abort the task: we still want to
 # write a summary row (with NA fields) so the sim is never silently missing.
 set +e
-python fit_dfe_moments_aged.py "${FIT_ARGS[@]}" ${EXTRA} 2>&1 | tee "${REPORT}"
+python "${FIT_SCRIPT}" "${FIT_ARGS[@]}" ${EXTRA} 2>&1 | tee "${REPORT}"
 FIT_RC=${PIPESTATUS[0]}
 set -e
 if [ "${FIT_RC}" -ne 0 ]; then

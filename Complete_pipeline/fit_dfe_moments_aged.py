@@ -59,6 +59,7 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).parent))
 from te_dfe.moments_dfe import (demes_graph_from_msmc, age_window_spectra,
+                                age_smearing_matrix,
                                 selfing_correction,
                                 burst_influx_per_window, observed_age_sfs,
                                 s_bin_midpoints, gamma_dfe_bins, poisson_ll,
@@ -66,10 +67,14 @@ from te_dfe.moments_dfe import (demes_graph_from_msmc, age_window_spectra,
                                 GAMMA_SCALE_DEFAULT)
 
 
-def load_ages(path, te_only=True, max_te=None, seed=0):
+def load_ages(path, te_only=True, max_te=None, seed=0, block_col=None):
     """Read the TSV from extract_te_ages.py.
 
-    Returns (freqs, ages, n_haps, seq_length_bp, n_windows). The sequence length
+    Returns (freqs, ages, n_haps, seq_length_bp, n_windows, block_ids). block_ids
+    is the per-TE value of `block_col` (e.g. a genomic-window id) used for the
+    BLOCK bootstrap, or None when the column is absent -- linked TEs must be
+    resampled together, so this column is what makes the CI honest. The
+    sequence length
     is taken from the '# seq_length_bp=' header that extract_te_ages.py writes,
     which is the SUM over a simulation's windows. A simulation is typically 20
     windows of 5 Mb, and getting the total wrong shifts log_lambda silently
@@ -96,13 +101,25 @@ def load_ages(path, te_only=True, max_te=None, seed=0):
     n_haps = int(np.median(d["n_haps"]))
     freqs = d["derived_count"] / n_haps
     ages = d["age_gen"]
+    blocks = None
+    if block_col:
+        if block_col in d.dtype.names:
+            blocks = np.asarray(d[block_col])
+        else:
+            print(f"  !! --boot-block-col {block_col!r} not in the ages file "
+                  f"(columns: {', '.join(d.dtype.names)}); the block bootstrap "
+                  f"will fall back to resampling individual TEs, which treats "
+                  f"linked TEs as independent and leaves the CI optimistic",
+                  file=sys.stderr)
     if max_te and len(freqs) > max_te:
         idx = np.random.default_rng(seed).choice(len(freqs), max_te, replace=False)
         freqs, ages = freqs[idx], ages[idx]
+        if blocks is not None:
+            blocks = blocks[idx]
         # NOTE subsampling TEs does NOT change the sequence they came from, so
         # seq_length is left alone; log_lambda then reports the rate implied by
         # the subsample, which is what you want when matching the network's budget.
-    return freqs, ages, n_haps, seq_len, n_win
+    return freqs, ages, n_haps, seq_len, n_win, blocks
 
 
 def _hessian(f, x, eps=None):
@@ -371,6 +388,43 @@ def main():
                     help="extra random starts per refit replicate, on top of the "
                          "warm start, as a hedge against the warm start locking "
                          "onto the point estimate's basin (default 1).")
+    ap.add_argument("--age-error-sigma", type=float, default=0.0, metavar="SIGMA",
+                    help="model AGE MEASUREMENT ERROR: ages are assumed observed "
+                         "as a_true * lognormal(0, SIGMA), and the per-window "
+                         "spectra are mixed accordingly before the likelihood. "
+                         "This is the correct way to handle an allele-age "
+                         "estimator's error: without it, leakage across bins "
+                         "attenuates the fit and biases selection toward "
+                         "neutrality. Use the same value you would pass to "
+                         "--jitter-ages. Windows narrower than exp(2*SIGMA) "
+                         "exchange most of their TEs with neighbours.")
+    ap.add_argument("--fit-age-error", action="store_true",
+                    help="ESTIMATE the age-error sigma jointly with the rest "
+                         "instead of fixing it at --age-error-sigma (which then "
+                         "acts as the starting value). Use when you have no "
+                         "external estimate of your age estimator's uncertainty. "
+                         "NOTE sigma trades off against log_duration: both blur "
+                         "the age structure, so fixing duration (--fix) is "
+                         "strongly advised when fitting sigma.")
+    ap.add_argument("--age-error-bounds", default="0.01,1.0", metavar="LO,HI",
+                    help="search range for the fitted age-error sigma.")
+    ap.add_argument("--neutral-ages", default=None, metavar="FILE",
+                    help="TSV of NEUTRAL SNP ages (extract_te_ages.py "
+                         "--snps-out). Their age-partitioned SFS is used as an "
+                         "EMPIRICAL neutral baseline in place of the purely "
+                         "demographic expectation: because the SNPs pass through "
+                         "the same demography AND the same age estimator as the "
+                         "TEs, this absorbs demographic misspecification and "
+                         "age-estimation distortion together. Same logic as "
+                         "calibrating a DFE on synonymous sites.")
+    ap.add_argument("--neutral-calibration", choices=["full", "shape"],
+                    default="full",
+                    help="'full' calibrates BOTH the across-window age profile "
+                         "and the within-window SFS shape (SNPs have no burst, "
+                         "so they give the burst-free baseline the burst then "
+                         "multiplies). 'shape' calibrates only the within-window "
+                         "shape and leaves the age profile theoretical -- safer "
+                         "if you suspect TEs and SNPs are dated differently.")
     ap.add_argument("--diagnostics", default=None, metavar="PREFIX",
                     help="write observed-vs-fitted SFS per age window: "
                          "<PREFIX>.sfs_fit.tsv (window, derived_count, obs, exp, "
@@ -423,8 +477,9 @@ def main():
         args.ne_for_gamma = N_ref
 
     # --- data -------------------------------------------------------------
-    freqs, ages, n_haps, seq_hdr, n_win = load_ages(
-        args.ages, max_te=args.max_te, seed=args.seed)
+    freqs, ages, n_haps, seq_hdr, n_win, block_ids = load_ages(
+        args.ages, max_te=args.max_te, seed=args.seed,
+        block_col=args.boot_block_col)
     if args.seq_length is None:
         if seq_hdr is None:
             sys.exit("--seq-length not given and the file has no "
@@ -451,6 +506,28 @@ def main():
         hi = age_edges[w + 1] if w + 1 < len(age_edges) else "inf"
         print(f"   [{age_edges[w]:>6.0f}, {str(hi):>6}) gen ago : {int(c):>7} TEs")
 
+    # --- empirical neutral baseline ---------------------------------------
+    NEUTRAL_CAL = None          # (n_win, n_freq) multiplicative correction
+    if args.neutral_ages:
+        nf, na, n_haps_n, _, _, _ = load_ages(args.neutral_ages, te_only=False)
+        if n_haps_n != n_haps:
+            print(f"  !! neutral SNPs have n_haps={n_haps_n} but TEs have "
+                  f"{n_haps}; the baseline cannot be compared cell-by-cell",
+                  file=sys.stderr)
+        if args.jitter_ages > 0:
+            # the SNPs must go through the SAME age distortion as the TEs,
+            # otherwise the calibration removes an error the TEs still carry
+            rng_n = np.random.default_rng(args.seed + 7)
+            na = na * rng_n.lognormal(0.0, args.jitter_ages, len(na))
+        NEUT_OBS = observed_age_sfs(nf, na, n_haps, age_edges)
+        print(f"neutral    : {len(nf)} SNPs, "
+              f"{int(NEUT_OBS.sum())} segregating, used as the empirical "
+              f"baseline ({args.neutral_calibration} calibration)")
+        for w, c in enumerate(NEUT_OBS.sum(axis=1)):
+            if c < 20:
+                print(f"  !! only {int(c)} neutral SNPs in age window {w}; the "
+                      f"baseline there will be noisy", file=sys.stderr)
+
     # --- spectrum grid: one set of age-window spectra per s bin ------------
     s_edges = np.concatenate([[0.0], np.geomspace(args.s_min, args.s_max,
                                                   args.n_s_bins)])
@@ -475,6 +552,32 @@ def main():
                            s_convention=args.s_convention)
         for g in gam_grid])                       # (n_s, n_win, n_haps-1)
     print(f"  grid shape {SPEC.shape}")
+
+    # Correction factor: empirical neutral / theoretical neutral. SPEC[0] is the
+    # lowest s bin, below the drift barrier and therefore neutral in every
+    # respect the SFS can see. Applied AFTER the model's own age mixing, so the
+    # distortion the SNPs carry (demography error, and the age estimator's own
+    # smearing if sigma is not modelled separately) is absorbed here.
+    if args.neutral_ages:
+        theo = np.asarray(SPEC[0], float)                 # (n_win, n_freq)
+        emp = np.asarray(NEUT_OBS, float)
+        if args.neutral_calibration == "full":
+            # normalise globally: the SNPs set the age profile too. They have no
+            # burst, so this is the burst-FREE baseline that m_w multiplies.
+            a = emp / max(emp.sum(), 1e-300)
+            b = theo / max(theo.sum(), 1e-300)
+        else:
+            # per-window: only the within-window shape is calibrated
+            a = emp / np.maximum(emp.sum(axis=1, keepdims=True), 1e-300)
+            b = theo / np.maximum(theo.sum(axis=1, keepdims=True), 1e-300)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            C = np.where(b > 0, a / b, 1.0)
+        # guard sparse cells: a window with no SNPs must not zero the model, and
+        # a huge ratio from one lucky SNP must not dominate
+        C = np.clip(np.nan_to_num(C, nan=1.0, posinf=1.0), 0.05, 20.0)
+        NEUTRAL_CAL = C
+        print(f"  neutral calibration: correction in "
+              f"[{C.min():.2f}, {C.max():.2f}], median {np.median(C):.2f}")
 
     # exactly what moments is fed: the s grid -> gamma_moments, and how many bins
     # hit the stability clip. This is the ground truth of the selection strengths
@@ -547,6 +650,8 @@ def main():
         bounds_all[names.index(k)] = (lo, hi)
 
     bounds = [bounds_all[i] for i in free]
+    if args.fit_age_error:
+        bounds = bounds + [tuple(float(v) for v in args.age_error_bounds.split(","))]
 
     # the mean_s slot is searched as log_scale in scale mode; label it as such
     def _coord_name(i):
@@ -610,7 +715,40 @@ def main():
     # --- objective --------------------------------------------------------
     t_max = float(getattr(CB, "SIM_LENGTH", 5000))
 
-    def model_per_unit(full):
+    # Age-measurement-error mixing. Built ONCE: it depends only on the age edges
+    # and sigma, not on the parameters. u_observed = M.T @ u_true.
+    FIT_SIGMA = bool(args.fit_age_error)
+    # cache the mixing matrix by sigma: when sigma is FITTED the optimiser asks
+    # for many nearby values, and rebuilding is the only per-call cost.
+    _mix_cache = {}
+    _mix_quad = 120 if FIT_SIGMA else 400
+
+    def age_mix(sigma):
+        if not (sigma and sigma > 0):
+            return None
+        key = round(float(sigma), 4)
+        M = _mix_cache.get(key)
+        if M is None:
+            M = age_smearing_matrix(age_edges, key, t_max=t_max,
+                                    n_quad=_mix_quad).T
+            _mix_cache[key] = M
+        return M
+
+    if args.age_error_sigma and args.age_error_sigma > 0:
+        _M0 = age_mix(args.age_error_sigma)
+        stay = float(np.mean(np.diag(_M0)))
+        print(f"age error  : sigma={args.age_error_sigma:g} "
+              f"{'(starting value, FITTED)' if FIT_SIGMA else 'modelled'}; mean "
+              f"P(TE stays in its own window) = {stay:.2f}")
+        if stay < 0.5:
+            print(f"  !! windows are narrow relative to the error kernel "
+                  f"(one-sigma span x{np.exp(-args.age_error_sigma):.2f} to "
+                  f"x{np.exp(args.age_error_sigma):.2f}); consider coarser "
+                  f"--age-edges", file=sys.stderr)
+    elif FIT_SIGMA:
+        print("age error  : sigma FITTED (starting from the bound midpoint)")
+
+    def model_per_unit(full, sigma=None):
         """Expected (age x freq) spectrum at unit influx; log_lambda is ignored."""
         if not np.isfinite(full).all():
             return None
@@ -622,6 +760,11 @@ def main():
                                       np.exp(full[I_DUR]), np.exp(full[I_MULT]),
                                       t_max=t_max)               # (n_win,)
         u = m_w[:, None] * np.tensordot(w_s, SPEC, axes=(0, 0))  # (n_win, n_f)
+        M = age_mix(args.age_error_sigma if sigma is None else sigma)
+        if M is not None:
+            u = M @ u                # mix ORIGIN windows into OBSERVED windows
+        if NEUTRAL_CAL is not None:
+            u = u * NEUTRAL_CAL      # empirical neutral baseline
         if not np.isfinite(u).all() or (u < 0).any() or u.sum() <= 0:
             return None
         return u
@@ -631,8 +774,8 @@ def main():
             return obs.sum() / u.sum()                          # closed-form MLE
         return 4.0 * N_ref * np.exp(full[I_LAM]) * args.seq_length
 
-    def nll_with_obs(full, obs_use):
-        u = model_per_unit(full)
+    def nll_with_obs(full, obs_use, sigma=None):
+        u = model_per_unit(full, sigma)
         if u is None:
             return 1e12
         theta_te = (obs_use.sum() / u.sum() if profile_lambda
@@ -641,10 +784,22 @@ def main():
             return 1e12
         return -poisson_ll(obs_use.ravel(), (theta_te * u).ravel())
 
-    def nll(full):
-        return nll_with_obs(full, obs)
+    def nll(full, sigma=None):
+        return nll_with_obs(full, obs, sigma)
 
-    obj = lambda x: nll(expand(x))
+    # When sigma is fitted it is an EXTRA trailing coordinate of the optimiser
+    # vector, kept outside `free` (which indexes model parameters only).
+    n_model_free = len(free)
+
+    def split_x(x):
+        x = np.asarray(x, float)
+        if FIT_SIGMA:
+            return x[:n_model_free], float(x[n_model_free])
+        return x, None
+
+    def obj(x):
+        xm, sg = split_x(x)
+        return nll(expand(xm), sg)
 
     # --- fit --------------------------------------------------------------
     from scipy.optimize import minimize, differential_evolution
@@ -708,9 +863,10 @@ def main():
     print(f"  {near}/{len(runs)} starts within 1 log-unit of the best")
 
     # --- report -----------------------------------------------------------
-    x = expand(best.x)
+    x_model, SIGMA_HAT = split_x(best.x)
+    x = expand(x_model)
     if profile_lambda:
-        u_best = model_per_unit(x)
+        u_best = model_per_unit(x, SIGMA_HAT)
         if u_best is not None and u_best.sum() > 0:
             theta_te = obs.sum() / u_best.sum()
             x[I_LAM] = np.log(theta_te / (4.0 * N_ref * args.seq_length))
@@ -727,6 +883,9 @@ def main():
         if truth:
             line += f"{truth[k]:>12.4f}"
         print(line)
+    if FIT_SIGMA:
+        print(f"  {'age_error_sigma':<18}{SIGMA_HAT:>12.4f}   "
+              f"(x{np.exp(-SIGMA_HAT):.2f} to x{np.exp(SIGMA_HAT):.2f} at 1 sigma)")
     print(f"  {'-logL':<18}{best.fun:>12.2f}")
 
     # the Gamma in (shape, scale): scale is the identifiable direction; mean_s and
@@ -739,7 +898,7 @@ def main():
     # not an optimum. Reported in the fit coordinate (log_scale in scale mode).
     for j, i in enumerate(free):
         lo, hi = bounds_all[i]
-        xi = float(best.x[j]); w = hi - lo
+        xi = float(x_model[j]); w = hi - lo
         if w <= 0:
             continue
         cn = _coord_name(i)
@@ -771,15 +930,12 @@ def main():
         return rng_b.integers(0, n_te, n_te)
 
     def _resolve_blocks(n_te):
-        if not args.boot_block_col:
+        if not args.boot_block_col or block_ids is None:
             return None
-        try:
-            blocks = np.asarray(block_ids)
-        except NameError:
-            blocks = None
-        if blocks is None or blocks.size != n_te:
-            print(f"  !! --boot-block-col {args.boot_block_col} not found in the "
-                  f"ages file; resampling individual TEs instead", file=sys.stderr)
+        blocks = np.asarray(block_ids)
+        if blocks.size != n_te:
+            print(f"  !! block column has {blocks.size} entries for {n_te} TEs; "
+                  f"resampling individual TEs instead", file=sys.stderr)
             return None
         return blocks
 
@@ -802,7 +958,9 @@ def main():
         for b in range(args.uncerts_bootstrap_refit):
             idx = _boot_index(rng_b, blocks, n_te)
             ob = observed_age_sfs(freqs[idx], ages[idx], n_haps, age_edges)
-            objb = lambda xf, _o=ob: nll_with_obs(expand(xf), _o)
+            def objb(xf, _o=ob):
+                xm, sg = split_x(xf)
+                return nll_with_obs(expand(xm), _o, sg)
             cand = []
             starts = [np.asarray(best.x, float)]
             for _ in range(max(0, args.boot_cold_starts)):
@@ -840,12 +998,18 @@ def main():
             # the joint bootstrap rather than an endpoint propagation. Written next
             # to the report when --diagnostics gives a prefix.
             if args.diagnostics:
-                draws = np.array([expand(bx) for bx in boot_x])   # (N, n_params)
+                # strip the fitted-sigma coordinate: expand() takes MODEL params only
+                draws = np.array([expand(split_x(bx)[0]) for bx in boot_x])
+                sig_draws = (np.array([split_x(bx)[1] for bx in boot_x])
+                             if FIT_SIGMA else None)
                 dpath = f"{args.diagnostics}.boot.tsv"
                 with open(dpath, "w") as fh:
-                    fh.write("log_gamma_shape\tlog_mean_s\n")
-                    for row in draws:
-                        fh.write(f"{row[I_SHAPE]:.6g}\t{row[I_MEANS]:.6g}\n")
+                    fh.write("log_gamma_shape\tlog_mean_s"
+                             + ("\tage_error_sigma\n" if sig_draws is not None else "\n"))
+                    for k_d, row in enumerate(draws):
+                        extra = (f"\t{sig_draws[k_d]:.6g}"
+                                 if sig_draws is not None else "")
+                        fh.write(f"{row[I_SHAPE]:.6g}\t{row[I_MEANS]:.6g}{extra}\n")
                 print(f"  bootstrap draws: {dpath} ({draws.shape[0]} replicates)")
 
     # Godambe (score bootstrap) / FIM: fast, but the interval is a local
@@ -860,7 +1024,10 @@ def main():
             for _ in range(args.uncerts_bootstrap):
                 idx = _boot_index(rng_b, blocks, n_te)
                 ob = observed_age_sfs(freqs[idx], ages[idx], n_haps, age_edges)
-                boot_nlls.append(lambda xf, _o=ob: nll_with_obs(expand(xf), _o))
+                def _bnll(xf, _o=ob):
+                    xm, sg = split_x(xf)
+                    return nll_with_obs(expand(xm), _o, sg)
+                boot_nlls.append(_bnll)
             print(f"\n  {args.uncerts_bootstrap} bootstrap replicate(s) for the "
                   f"Godambe correction "
                   f"({'block' if blocks is not None else 'TE-level'} resampling)")
@@ -884,7 +1051,7 @@ def main():
 
     # --- observed vs fitted SFS per age window ----------------------------
     if args.diagnostics:
-        u_fit = model_per_unit(x)
+        u_fit = model_per_unit(x, SIGMA_HAT)
         if u_fit is None:
             print("  !! could not build the fitted spectrum; no diagnostics written",
                   file=sys.stderr)

@@ -661,6 +661,67 @@ def age_window_spectra(graph, n_haps, gamma_ours, age_edges, gamma_scale=GAMMA_S
     return out
 
 
+def age_smearing_matrix(age_edges, sigma, t_max=None, n_quad=400):
+    """M[w, w'] = P(a TE that ORIGINATED in window w is ASSIGNED to window w')
+    under multiplicative lognormal age error: a_obs = a_true * exp(N(0, sigma)).
+
+    This is the measurement-error model for age-partitioned fitting. Because the
+    expected spectrum is LINEAR in the per-window influx, age error is exactly a
+    linear mixing of the per-window spectra:
+
+        u_observed = M.T @ u_true
+
+    so correcting for it costs one matrix multiply per likelihood evaluation and
+    no extra moments work. Without it, age error acts as attenuation: TEs leak
+    across boundaries, the age structure washes out, and selection is biased
+    toward neutrality (the estimate is pulled to the flat part of the surface).
+
+    IMPORTANT sizing rule: leakage is severe whenever a window is NARROWER than
+    the error kernel. At sigma the one-sigma multiplicative span is
+    [exp(-sigma), exp(+sigma)], so a window spanning less than a factor
+    exp(2*sigma) mostly exchanges TEs with its neighbours. At sigma=0.3 that is a
+    factor 1.82: bins like [200,250) (factor 1.25) are far too narrow.
+
+    Rows sum to 1 by construction (every TE is assigned somewhere; the final
+    window runs to infinity so it absorbs the old tail). sigma=0 gives identity.
+
+    Ages within a window are integrated LOG-uniformly, which is the neutral
+    choice when the within-window age density is unknown, and is exact in the
+    limit of narrow windows.
+    """
+    edges = np.asarray(age_edges, float)
+    n_win = len(edges)
+    if not (sigma and sigma > 0):
+        return np.eye(n_win)
+    from scipy.stats import norm
+
+    hi_edges = np.concatenate([edges[1:], [np.inf]])
+    t_top = float(t_max if t_max is not None else max(edges[-1] * 10.0, 1.0))
+    M = np.zeros((n_win, n_win))
+    for w in range(n_win):
+        lo, hi = edges[w], hi_edges[w]
+        # quadrature nodes in LOG age across the true window
+        lo_q = max(lo, 1e-6)
+        hi_q = t_top if np.isinf(hi) else hi
+        if hi_q <= lo_q:
+            M[w, w] = 1.0
+            continue
+        a = np.exp(np.linspace(np.log(lo_q), np.log(hi_q), n_quad))
+        for wp in range(n_win):
+            lo_p, hi_p = edges[wp], hi_edges[wp]
+            # P(a * lognormal in [lo_p, hi_p)) for each node
+            z_hi = (np.inf if np.isinf(hi_p)
+                    else (np.log(max(hi_p, 1e-300) / a) / sigma))
+            z_lo = (-np.inf if lo_p <= 0
+                    else (np.log(lo_p / a) / sigma))
+            p = norm.cdf(z_hi) - norm.cdf(z_lo)
+            M[w, wp] = float(np.mean(np.clip(p, 0.0, 1.0)))
+        s = M[w].sum()
+        if s > 0:
+            M[w] /= s                       # rows are probabilities
+    return M
+
+
 def burst_influx_per_window(age_edges, t_start_ago, duration, multiplier,
                             t_max=None):
     """Mean influx multiplier in each age window.
