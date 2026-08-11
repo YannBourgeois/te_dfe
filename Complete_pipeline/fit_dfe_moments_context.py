@@ -163,6 +163,10 @@ def main():
     ap.add_argument("--s-max", type=float, default=1.0)
     ap.add_argument("--recomb-typical", type=float, default=1e-7)
     ap.add_argument("--recomb-log-scale", type=float, default=1.0)
+    ap.add_argument("--recomb-clip", type=float, default=2.0,
+                    help="phi_r is clipped to +/- this. Too small a value piles "
+                         "a point mass on the boundary, which ties the quantile "
+                         "edges and collapses recombination bins.")
     ap.add_argument("--n-starts", type=int, default=20)
     ap.add_argument("--n-rounds", type=int, default=3)
     ap.add_argument("--maxiter", type=int, default=300)
@@ -185,6 +189,13 @@ def main():
     ap.add_argument("--boot-block-col", default=None, metavar="COLUMN",
                     help="resample whole blocks of this column (e.g. 'window') "
                          "so linked TEs stay together.")
+    ap.add_argument("--recomb-map", default=None, metavar="FILE",
+                    help="interval table from extract_te_ages.py "
+                         "--recomb-map-out (window, start, end, rate). Gives the "
+                         "EXACT sequence length behind each recombination bin, "
+                         "which is what log_lambda is scaled against. Strongly "
+                         "preferred over the neutral-SNP proxy, and the natural "
+                         "place to apply callability masks later.")
     ap.add_argument("--neutral-ages", default=None, metavar="FILE",
                     help="TSV of NEUTRAL SNP ages+recombination "
                          "(extract_te_ages.py --snps-out --recomb auto). Used as "
@@ -246,9 +257,31 @@ def main():
         sys.exit("--age-edges must start at 0")
 
     # equal-count recombination bins, so every cell carries comparable weight
-    ph = phi_r(rec, args.recomb_typical, args.recomb_log_scale)
+    ph = phi_r(rec, args.recomb_typical, args.recomb_log_scale, args.recomb_clip)
     n_rb = int(args.recomb_bins)
     qs = np.quantile(ph, np.linspace(0, 1, n_rb + 1))
+    # phi_r is CLIPPED at +/-clip, so a wide recombination distribution piles a
+    # point mass on the boundary. Tied values make np.quantile return duplicate
+    # edges, which silently yields EMPTY bins (n=0, phi_rep=0) -- and an empty
+    # bin then makes the exact sequence-share check fail and fall back. Collapse
+    # duplicate edges and reduce the bin count to what the data can actually
+    # support, rather than carrying dead bins through the whole fit.
+    # Deduplicate BEFORE widening the outer edges. Doing it the other way round
+    # leaves the -1e-9 as a real edge, so bin 0 becomes [v-1e-9, v) and is empty
+    # by construction while the tied mass lands in bin 1 -- which then fails the
+    # exact sequence-share check and silently falls back to TE counts.
+    qs = np.unique(np.round(qs, 12))
+    if len(qs) - 1 < n_rb:
+        n_rb_new = max(1, len(qs) - 1)
+        vals, cnts = np.unique(np.round(ph, 12), return_counts=True)
+        top = vals[np.argmax(cnts)]
+        print(f"  !! only {n_rb_new} distinct recombination quantiles available "
+              f"(asked for {n_rb}): {cnts.max()/len(ph):.0%} of TEs share "
+              f"phi_r={top:.3f}, so the quantile edges tie. Using {n_rb_new} "
+              f"bins. (A point mass usually means zero-rate intervals in the "
+              f"map, or clipping -- see --recomb-clip.)", file=sys.stderr)
+        n_rb = n_rb_new
+    qs = qs.astype(float)
     qs[0] -= 1e-9; qs[-1] += 1e-9
     rbin = np.clip(np.searchsorted(qs, ph, side="right") - 1, 0, n_rb - 1)
     # representative phi per bin (mean of the TEs in it) and the sequence
@@ -256,8 +289,60 @@ def main():
     # underlying sequence share is what scales the influx)
     phi_rep = np.array([ph[rbin == r].mean() if (rbin == r).any() else 0.0
                         for r in range(n_rb)])
-    frac_L = np.array([(rbin == r).sum() for r in range(n_rb)], float)
-    frac_L = frac_L / frac_L.sum()
+    # SEQUENCE share of each recombination bin -- NOT the TE-count share.
+    # With equal-count bins the TE share is 1/n_rb by construction, but bins
+    # where TEs are dense span LESS sequence. Using TE counts inflates u.sum()
+    # and, because theta = obs.sum()/u.sum(), biases log_lambda DOWNWARD by
+    # roughly log(AM/HM) of exp(gamma_r*phi): about -0.27 at |gamma_r|=0.6 and
+    # -0.65 at 1.0, and it does NOT shrink with more bins.
+    #
+    # Neutral SNPs accumulate at a near-constant rate per bp, so their count per
+    # recombination bin estimates the sequence share directly. Without them we
+    # fall back on the TE share and warn, since lambda is then biased.
+    frac_L = None
+    # BEST: exact sequence length per recombination bin, from the map itself.
+    if args.recomb_map:
+        try:
+            mp = np.genfromtxt(args.recomb_map, names=True, delimiter="\t")
+            m_len = np.atleast_1d(mp["end"]) - np.atleast_1d(mp["start"])
+            m_phi = phi_r(np.atleast_1d(mp["rate"]), args.recomb_typical,
+                          args.recomb_log_scale, args.recomb_clip)
+            m_bin = np.clip(np.searchsorted(qs, m_phi, side="right") - 1,
+                            0, n_rb - 1)
+            bp = np.array([m_len[m_bin == r].sum() for r in range(n_rb)], float)
+            if bp.sum() > 0 and (bp > 0).all():   # every kept bin has sequence
+                frac_L = bp / bp.sum()
+                print("  sequence share per recombination bin from the "
+                      "recombination map (exact): "
+                      + ", ".join(f"{v:.3f}" for v in frac_L)
+                      + f"  [{bp.sum()/1e6:.1f} Mb covered]")
+            else:
+                print("  !! recombination map leaves a bin with no sequence; "
+                      "falling back", file=sys.stderr)
+        except Exception as e:
+            print(f"  !! could not read {args.recomb_map}: {type(e).__name__}: {e}",
+                  file=sys.stderr)
+    if frac_L is None and args.neutral_ages:
+        try:
+            _nf, _na, _nrec, _nh, _sl, _nw, _blk = load_ages_recomb(args.neutral_ages)
+            _nph = phi_r(_nrec, args.recomb_typical, args.recomb_log_scale,
+                         args.recomb_clip)
+            _nrb = np.clip(np.searchsorted(qs, _nph, side="right") - 1, 0, n_rb - 1)
+            cnt = np.array([(_nrb == r).sum() for r in range(n_rb)], float)
+            if cnt.sum() > 0 and (cnt > 0).all():
+                frac_L = cnt / cnt.sum()
+                print("  sequence share per recombination bin from neutral SNPs: "
+                      + ", ".join(f"{v:.3f}" for v in frac_L))
+        except Exception as e:
+            print(f"  !! could not derive sequence share from {args.neutral_ages}: "
+                  f"{type(e).__name__}", file=sys.stderr)
+    if frac_L is None:
+        frac_L = np.array([(rbin == r).sum() for r in range(n_rb)], float)
+        frac_L = frac_L / frac_L.sum()
+        print("  !! sequence share per recombination bin taken from TE counts "
+              "(no --neutral-ages): log_lambda will be biased LOW, by ~0.3 log "
+              "units at |gamma_r|=0.6. alpha_r / gamma_r are unaffected.",
+              file=sys.stderr)
 
     obs = observed_age_recomb_sfs(freqs, ages, rbin, n_haps, age_edges, n_rb)
     print(f"data       : {len(freqs)} TEs, {args.seq_length/1e6:.1f} Mb, "
@@ -308,10 +393,19 @@ def main():
             b = theo / np.maximum(theo.sum(axis=2, keepdims=True), 1e-300)
         with np.errstate(divide="ignore", invalid="ignore"):
             C = np.where(b > 0, a / b, 1.0)
-        NEUTRAL_CAL = np.clip(np.nan_to_num(C, nan=1.0, posinf=1.0), 0.05, 20.0)
+        n_clip = float(np.mean((C < 0.05) | (C > 20.0) | ~np.isfinite(C)))
+        C = np.clip(np.nan_to_num(C, nan=1.0, posinf=1.0), 0.05, 20.0)
+        # see the note in fit_dfe_moments_aged.py: clipping breaks the
+        # total-preserving property of C and biases log_lambda through theta0.
+        renorm = (theo * C).sum() / max(theo.sum(), 1e-300)
+        if renorm > 0:
+            C = C / renorm
+        NEUTRAL_CAL = C
         print(f"neutral    : {len(nf)} SNPs -> empirical baseline "
               f"({args.neutral_calibration}); correction in "
-              f"[{NEUTRAL_CAL.min():.2f}, {NEUTRAL_CAL.max():.2f}]")
+              f"[{C.min():.2f}, {C.max():.2f}]; {n_clip:.1%} clipped, "
+              f"renormalised by {renorm:.4f} "
+              f"(would shift log_lambda {-np.log(renorm):+.3f})")
 
     # --- age-error mixing --------------------------------------------------
     FIT_SIGMA = bool(args.fit_age_error)

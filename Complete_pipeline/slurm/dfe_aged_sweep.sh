@@ -121,8 +121,9 @@ REPORT="${OUT_DIR}/${BASE}.fit.txt"
 
 # --- step 1: exact ages out of the tree sequences ---------------------------
 SNPS="${OUT_DIR}/${BASE}.snps.tsv"
+RMAP="${OUT_DIR}/${BASE}.recomb_map.tsv"
 EX_ARGS=(--trees "${TREES[@]}" --out "${AGES}")
-if [ -n "${RECOMB}" ];    then EX_ARGS+=(--recomb "${RECOMB}"); fi
+if [ -n "${RECOMB}" ];    then EX_ARGS+=(--recomb "${RECOMB}" --recomb-map-out "${RMAP}"); fi
 if [ "${NEUTRAL}" = "1" ]; then
     EX_ARGS+=(--snps-out "${SNPS}" --max-snps-per-window "${MAX_SNPS}")
 fi
@@ -202,6 +203,7 @@ if [ "${MODEL_KIND}" = "context" ]; then
     FIT_SCRIPT=fit_dfe_moments_context.py
     export TE_DFE_MODEL=context MODEL=context
     FIT_ARGS+=(--recomb-bins "${RECOMB_BINS}")
+    if [ -s "${RMAP}" ]; then FIT_ARGS+=(--recomb-map "${RMAP}"); fi
     if [ "${BOOTSTRAP}" -gt 0 ] 2>/dev/null; then
         FIT_ARGS+=(--uncerts-bootstrap-refit "${BOOTSTRAP}")
     else
@@ -269,3 +271,4 @@ with open(summary, "a") as fh:
     fcntl.flock(fh, fcntl.LOCK_UN)
 print(f"[aged] appended {base} to {summary} (fit_rc={fit_rc})")
 PY
+

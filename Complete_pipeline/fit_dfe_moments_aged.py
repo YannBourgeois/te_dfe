@@ -9,28 +9,22 @@ them, because the two act on different axes:
     a BURST     changes the total COUNT in one age window
     SELECTION   changes the SFS SHAPE within every window
 
-moments.Demes.SFS supports exactly this via `mutation_time_windows`, which
+moments.Demes.SFS supports this via `mutation_time_windows`, which
 returns one spectrum per window containing the mutations that ORIGINATED in it.
 
-Two things follow, and the second is what makes this practical:
+Two things:
 
-  * under infinite sites the spectrum is LINEAR in the influx, so if the influx
+  * under infinite sites the spectrum is linear in the influx, so if the influx
     during window w is theta * m_w, that window contributes m_w * S_w with S_w
     the unit-influx spectrum. The expensive moments integration therefore
-    depends only on (gamma, demography) and NOT on the burst;
+    depends only on (gamma, demography) and not on the burst;
   * so the three burst parameters are a linear reweighting of precomputed rows.
-    They are almost free to move, and the objective is smooth in them by
-    construction, which also removes the zero-gradient failure that the
-    marginal-SFS version had to work around.
+    They are almost free to move.
 
 OPTIMISATION
-    log_lambda is theta0: a pure SCALE on the expected spectrum. For a Poisson
-    likelihood its MLE is closed form (theta_te = obs.sum() / u.sum(), exactly
-    moments/dadi's optimal_sfs_scaling), so it is PROFILED OUT by default rather
-    than searched. That drops a dimension and removes the lambda<->multiplier
+    log_lambda is theta0, which is typically trivial to rescale after inference. That drops a dimension and removes the lambda<->multiplier
     scale trade-off that makes the surface rugged. The remaining parameters are
-    fit with differential_evolution (gradient-free, robust to the kinks that
-    burst-window overlaps introduce), polished with one L-BFGS-B step. Pass
+    fit with differential_evolution, polished with one L-BFGS-B step. Pass
     --optimizer multistart for the old random-restart behaviour, or
     --no-profile-lambda / --fix log_lambda=... to fit the scale explicitly.
 
@@ -44,8 +38,6 @@ WHERE THE AGES COME FROM
                  separation, so validate with --jitter-ages to see how much
                  error the method tolerates before committing to an estimator.
 
-    LIMITATION: allele-age estimators assume outcrossing and recombination.
-    Highly selfing species are out of scope for the real-data route.
 
     TE_DFE_MODEL=simple python fit_dfe_moments_aged.py \\
         --ages ages.tsv --seq-length 1e9 \\
@@ -574,10 +566,21 @@ def main():
             C = np.where(b > 0, a / b, 1.0)
         # guard sparse cells: a window with no SNPs must not zero the model, and
         # a huge ratio from one lucky SNP must not dominate
+        n_clip = float(np.mean((C < 0.05) | (C > 20.0) | ~np.isfinite(C)))
         C = np.clip(np.nan_to_num(C, nan=1.0, posinf=1.0), 0.05, 20.0)
+        # Unclipped, C is EXACTLY total-preserving: sum(theo*C) == theo.sum(),
+        # because a and b are both normalised. Clipping breaks that identity and
+        # rescales the whole model, which theta0 then absorbs -- biasing
+        # log_lambda by -log(factor). Renormalise so the calibration only
+        # REDISTRIBUTES: it corrects shape, never the overall scale.
+        renorm = (theo * C).sum() / max(theo.sum(), 1e-300)
+        if renorm > 0:
+            C = C / renorm
         NEUTRAL_CAL = C
         print(f"  neutral calibration: correction in "
-              f"[{C.min():.2f}, {C.max():.2f}], median {np.median(C):.2f}")
+              f"[{C.min():.2f}, {C.max():.2f}], median {np.median(C):.2f}; "
+              f"{n_clip:.1%} of cells clipped, renormalised by {renorm:.4f} "
+              f"(without this log_lambda would shift {-np.log(renorm):+.3f})")
 
     # exactly what moments is fed: the s grid -> gamma_moments, and how many bins
     # hit the stability clip. This is the ground truth of the selection strengths

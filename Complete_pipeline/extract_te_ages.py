@@ -112,6 +112,34 @@ def recomb_at(positions, rmap, seq_len):
     return rates[idx]
 
 
+def recomb_intervals(rmap, seq_len):
+    """(start, end, rate) arrays covering one window, from a loaded map.
+
+    Handles the three layouts load_recomb_map can return: edges (n+1) with rates
+    (n), equal-length (position, rate) samples, and rates-only over uniform bins.
+    Writing these out lets the fit compute the SEQUENCE LENGTH behind each
+    recombination class exactly, instead of proxying it from site counts -- and
+    makes masking trivial later, since a masked region is just a trimmed or
+    dropped interval.
+    """
+    if rmap is None:
+        return None
+    edges, rates = rmap
+    rates = np.asarray(rates, float).ravel()
+    if edges is None:                                   # uniform bins
+        n = len(rates)
+        b = np.linspace(0.0, seq_len, n + 1)
+        return b[:-1], b[1:], rates
+    edges = np.asarray(edges, float).ravel()
+    if len(edges) == len(rates) + 1:                    # standard form
+        return edges[:-1], edges[1:], rates
+    if len(edges) == len(rates):                        # samples: extend to the end
+        end = np.concatenate([edges[1:], [seq_len]])
+        return edges, end, rates
+    n = min(len(edges) - 1, len(rates))
+    return edges[:n], edges[1:n + 1], rates[:n]
+
+
 def find_recomb_file(trees_path):
     """Sibling recombination npz for one .trees file, or None.
 
@@ -316,6 +344,13 @@ def main():
                          "frequencies) to this TSV. Used by the fit's "
                          "--neutral-ages to build an EMPIRICAL neutral baseline "
                          "instead of relying on the demographic expectation.")
+    ap.add_argument("--recomb-map-out", default=None, metavar="FILE",
+                    help="write the recombination map as explicit intervals "
+                         "(window, start, end, rate). The context fit uses this "
+                         "to get the SEQUENCE LENGTH behind each recombination "
+                         "bin exactly, which is what log_lambda is scaled "
+                         "against; without it the sequence share has to be "
+                         "proxied and lambda comes out biased.")
     ap.add_argument("--max-snps-per-window", type=int, default=20000,
                     help="random subset of neutral SNPs kept per window "
                          "(they vastly outnumber TEs; the baseline only needs "
@@ -353,6 +388,31 @@ def main():
               f"segregating TEs over {seq_len/1e6:.2f} Mb"
               + (f", {int((r['is_te'] == 0).sum())} background"
                  if args.include_background else "") + rec_note)
+    if args.recomb_map_out:
+        iv_rows = []
+        for k, tp in enumerate(args.trees):
+            if rec_paths[k] is None:
+                continue
+            import tskit as _tsk
+            sl = float(_tsk.load(str(tp)).sequence_length)
+            iv = recomb_intervals(load_recomb_map(rec_paths[k]), sl)
+            if iv is None:
+                continue
+            st, en, ra = iv
+            for a, b_, r_ in zip(st, en, ra):
+                iv_rows.append((k, a, b_, r_))
+        if iv_rows:
+            with open(args.recomb_map_out, "w") as fh:
+                fh.write("window\tstart\tend\trate\n")
+                for k, a, b_, r_ in iv_rows:
+                    fh.write(f"{k}\t{a:.1f}\t{b_:.1f}\t{r_:.6g}\n")
+            tot = sum(b_ - a for _, a, b_, _ in iv_rows)
+            print(f"wrote {args.recomb_map_out}: {len(iv_rows)} intervals "
+                  f"covering {tot/1e6:.1f} Mb")
+        else:
+            print("  !! no recombination maps available; --recomb-map-out "
+                  "skipped", file=sys.stderr)
+
     if args.snps_out:
         rng_s = np.random.default_rng(0)
         snp_rows = []

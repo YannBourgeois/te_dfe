@@ -32,12 +32,18 @@ import re
 import sys
 from pathlib import Path
 
-PARAMS = ["log_lambda", "log_gamma_shape", "log_mean_s",
-          "log10_t_start", "log_duration", "log_multiplier"]
+# Union of the SIMPLE and CONTEXT parameter sets: one collector serves both.
+# Sorted longest-first so the regex alternation cannot match "gamma_r" inside
+# "log_gamma_shape".
+PARAMS_SIMPLE = ["log_lambda", "log_gamma_shape", "log_mean_s",
+                 "log10_t_start", "log_duration", "log_multiplier"]
+PARAMS_CONTEXT = ["log_lambda", "log_s_global", "alpha_r", "gamma_r",
+                  "log10_t_start", "log_duration", "log_multiplier"]
+PARAMS = sorted(set(PARAMS_SIMPLE) | set(PARAMS_CONTEXT), key=len, reverse=True)
 
 # "  log_lambda            -20.4994     1.251e-09    -20.4056"
 # "  log10_t_start           2.6405       437 gen      2.7437"   <- natural is 2 tokens
-_PARAM_LINE = re.compile(r"^\s+(" + "|".join(PARAMS) + r")\s+(-?\d+\.\d+|nan)\s+(.*)$")
+_PARAM_LINE = re.compile(r"^\s+(" + "|".join(PARAMS) + r")\s+(-?\d+\.\d+|nan)\s*(.*)$")
 
 
 def _f(tok):
@@ -62,6 +68,15 @@ def parse_report(path):
                   txt, re.M)
     if m:
         row["n_te"], row["seq_mb"], row["n_age_windows"] = m.group(1), m.group(2), m.group(3)
+    else:
+        # context model: "data : 889 TEs, 100.0 Mb, 6 age x 4 recomb cells"
+        m = re.search(r"^data\s*:\s*(\d+)\s+TEs,\s*([\d.]+)\s*Mb,\s*(\d+)\s+age\s*x\s*(\d+)\s+recomb",
+                      txt, re.M)
+        if m:
+            row["n_te"], row["seq_mb"] = m.group(1), m.group(2)
+            row["n_age_windows"], row["n_recomb_bins"] = m.group(3), m.group(4)
+    row["model"] = "context" if "recomb bins (phi_r)" in txt or "n_recomb_bins" in row \
+                   else "simple"
 
     # per-window counts: "   [     0,   25.0) gen ago :     262 TEs"
     win = re.findall(r"^\s*\[\s*[\d.]+,\s*\S+\)\s*gen ago\s*:\s*(\d+)\s+TEs", txt, re.M)
@@ -101,14 +116,22 @@ def parse_report(path):
         tail = txt[h.end():]
         e = re.search(r"^\s+-logL\s", tail, re.M)
         tbl = tail[:e.start()] if e else tail
+    # The SIMPLE report has columns  parameter | estimate | natural | truth,
+    # the CONTEXT report has  parameter | estimate | truth  (no natural). Read
+    # the header rather than assuming positions, or the context truth column is
+    # taken from the wrong token.
+    has_natural = bool(h and "natural" in h.group(0))
     got = 0
     for line in tbl.splitlines():
         m = _PARAM_LINE.match(line)
         if not m:
             continue
         name, est, rest = m.group(1), m.group(2), m.group(3).split()
-        # natural column is 2 tokens only for log10_t_start ("437 gen")
-        n_nat = 2 if name == "log10_t_start" else 1
+        if has_natural:
+            # natural column is 2 tokens only for log10_t_start ("437 gen")
+            n_nat = 2 if name == "log10_t_start" else 1
+        else:
+            n_nat = 0
         truth = rest[n_nat] if len(rest) > n_nat else None
         row[f"fit_{name}"] = est
         row[f"true_{name}"] = truth if truth is not None else ""
@@ -135,6 +158,16 @@ def parse_report(path):
     if m:
         row["n_bootstrap"] = m.group(1)
     row["hessian_not_pd"] = int("Hessian is not positive definite" in txt)
+
+    # --- context: implied selection / insertion per recombination bin ------
+    # "    bin 0 (phi_r=-1.20): s_local=3.1e-03  2Ne*s=3.1  insertion x0.55"
+    for mm in re.finditer(r"^\s+bin (\d+) \(phi_r=([-+\d.]+)\):\s*s_local=(\S+)\s+"
+                          r"2Ne\*s=(\S+)\s+insertion x(\S+)", txt, re.M):
+        b = mm.group(1)
+        row[f"phi_r_bin{b}"] = mm.group(2)
+        row[f"s_local_bin{b}"] = mm.group(3)
+        row[f"gamma_bin{b}"] = mm.group(4)
+        row[f"insertion_bin{b}"] = mm.group(5)
 
     # --- DFE composition, as printed --------------------------------------
     for label, key in [("effectively neutral", "p_neutral"),
