@@ -1,6 +1,6 @@
-# te_dfe, NPE package for TE DFE + burst inference
+# te_dfe, an inference package for TE distribution of fitness effects and burst inference, using simulations (sbi) or diffusion theory (moments)
 
-Neural Posterior Estimation for transposable-element evolution from genotype
+The simulation-based part is mostly running with Neural Posterior Estimation, and aims at quantifying transposable-element evolution from genotype
 data. Two models can be selected at runtime:
 
   * **DFE, simple**: 6-parameter gamma DFE over |s| + a single rectangular burst.
@@ -191,6 +191,10 @@ python 07_export_sumstat_summaries.py --dataset benchmark_simple/observations --
 Of course, this is still very dense and complex, I am working on making the whole pipeline more accessible, but hopefully this should already give an idea of the procedure.
 
 To read the active model in code: `te_dfe.config.MODEL_NAME`.
+
+## moments-based path
+
+I am also experimenting with functions found in the population genetics package moments. You can find examples of commands to estimate parameters on simulated data [here](https://yannbourgeois.github.io/assets/html/Blog_post_TE_selection_inference.html#an-extremely-fast-solution-based-on-diffusion-theory-fitting-age-dependent-sfs-with-time-varying-theta-on-bins-of-tes-age). I will work on a more detailed wiki soon.
 
 ## Configuration layout (shared base + model overlays)
 
