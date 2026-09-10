@@ -42,6 +42,192 @@ def feature_r(recomb_rate, recomb_typical, log_scale, clip=2.0):
     return np.clip(v, -clip, clip)
 
 
+# ---------------------------------------------------------------------------
+# PURIFYING SELECTION BY PER-TE PRUNING (replaces the nu/expansion proxy)
+#
+# The expansion proxy mimicked selection by distorting the GENEALOGY, which has
+# two structural faults the diagnostics exposed: (i) it also suppresses neutral
+# SNP diversity, so local_snp_density / n_flank_snps_norm drift 2-4 SDs from
+# SLiM and get worse the harder you push it; (ii) it only RAREFIES TEs, so mean
+# frequency bottoms out at the all-singleton floor (~1/n) and cannot reach the
+# strong-selection regime -- the observed ceiling around SLiM log_mean_s ~ -6.
+#
+# Instead: simulate TEs NEUTRALLY on one undistorted tree, then PRUNE each TE
+# with a probability derived from Wright-Fisher / Poisson-Random-Field theory,
+# using that TE's OWN local selection coefficient. Removal has no floor and no
+# SNP side effect.
+#
+# Equilibrium density of segregating sites at frequency x (Sawyer & Hartl 1992),
+# with gamma = 4*Ne*s and s > 0 deleterious:
+#
+#     f(x | gamma) = (1 - e^{gamma(1-x)}) / ((1 - e^{gamma}) * x(1-x))
+#
+# gamma -> 0 gives f = 1/x (neutral); gamma large gives f ~ e^{-gamma x}/(x(1-x)).
+# The keep-probability is the ratio of the SELECTED to the NEUTRAL expected
+# SAMPLE spectrum, so thinning a neutral sample reproduces the selected one:
+#
+#     p_keep(i | gamma) = E[S_i | gamma] / E[S_i | 0],   E[S_i | 0] = 1/i
+#
+# p_keep(i|0) = 1 for all i (exactly nested null), and p_keep decreases with
+# frequency, so common TEs are removed preferentially -- purifying selection.
+# The TOTAL count also drops, which restores the density channel alpha_r and
+# gamma_r need and which the expansion proxy could not produce.
+# ---------------------------------------------------------------------------
+def _prf_pop_density(x, gamma):
+    """f(x | gamma), the PRF equilibrium frequency density (vectorised in x)."""
+    x = np.asarray(x, float)
+    if abs(gamma) < 1e-9:
+        return 1.0 / x
+    if gamma < 500.0:                       # expm1 form: stable for small gamma
+        return np.expm1(gamma * (1.0 - x)) / (np.expm1(gamma) * x * (1.0 - x))
+    return np.exp(-gamma * x) / (x * (1.0 - x))     # asymptote, avoids overflow
+
+
+def build_prf_keep_table(n_haps, gamma_grid, n_quad=4000):
+    """p[g, i] = E[S_i | gamma_grid[g]] / E[S_i | 0], for i = 1 .. n_haps-1.
+
+    One vectorised quadrature over a shared x grid; the binomial sampling matrix
+    is built once. Costs well under a second and is done at startup.
+    """
+    from scipy.special import gammaln
+    n = int(n_haps)
+    # x grid concentrated near the boundaries where the density is steep
+    u = np.linspace(0.0, 1.0, n_quad + 2)[1:-1]
+    x = u ** 3 / (u ** 3 + (1 - u) ** 3)            # symmetric boundary clustering
+    x = np.clip(x, 1e-9, 1 - 1e-9)
+    dx = np.gradient(x)
+    i_idx = np.arange(1, n)
+    # B[i, x] = C(n,i) x^i (1-x)^(n-i)   in logs for stability
+    lb = (gammaln(n + 1) - gammaln(i_idx + 1) - gammaln(n - i_idx + 1))[:, None]
+    B = np.exp(lb + i_idx[:, None] * np.log(x)[None, :]
+               + (n - i_idx)[:, None] * np.log1p(-x)[None, :])
+    neutral = 1.0 / i_idx                            # E[S_i | 0]
+    tab = np.empty((len(gamma_grid), n - 1))
+    for gi, g in enumerate(gamma_grid):
+        f = _prf_pop_density(x, float(g))
+        tab[gi] = (B * (f * dx)[None, :]).sum(axis=1) / neutral
+    return np.clip(tab, 0.0, 1.0)
+
+
+def build_prf_keep_table_moments(n_haps, gamma_grid, baseline_msmc, ne_ref,
+                                 gamma_scale, h=0.5, verbose=True):
+    """RIGOROUS backend: p_keep from spectra computed under the ACTUAL demography.
+
+        p_keep(i | gamma) = E[S_i | gamma, demography] / E[S_i | 0, demography]
+
+    Both numerator and denominator are integrated through the real MSMC history
+    with `moments`, so the separability approximation of the analytic backend
+    (selection's RELATIVE distortion is demography-independent) is dropped
+    entirely. Under a constant history this must reduce to the analytic table --
+    that is what --prf-selftest checks.
+
+    CONVENTIONS (the easy thing to get wrong):
+      * moments/dadi use gamma_m = 2*N_ref*s with gamma_m POSITIVE = BENEFICIAL.
+        Our gamma is gamma_scale*Ne*s with gamma POSITIVE = DELETERIOUS. So
+        gamma_m = -2*N_ref*gamma / (gamma_scale*ne_ref).
+      * `h` is the dominance coefficient; 0.5 = additive. Match the SLiM sims.
+      * Time in moments is in units of 2*N_ref generations; sizes are relative
+        to N_ref. N_ref is taken as the ancestral size (where the steady state
+        is computed).
+    """
+    import moments
+    n = int(n_haps)
+
+    # --- forward-time epoch list: (relative size, scaled duration) ------------
+    epochs = []
+    N_ref = float(ne_ref)
+    if baseline_msmc is not None and getattr(baseline_msmc, "epochs", None):
+        eps = sorted(baseline_msmc.epochs, key=lambda e: e.slim_gen_start)
+        N_ref = float(getattr(baseline_msmc, "ancestral_ne", eps[0].ne))
+        bounds = [e.slim_gen_start for e in eps] + [float(baseline_msmc.sim_length)]
+        for k, e in enumerate(eps):
+            dur = float(bounds[k + 1] - bounds[k])
+            if dur > 0:
+                epochs.append((float(e.ne) / N_ref, dur / (2.0 * N_ref)))
+    if verbose:
+        print(f"[prf-moments] N_ref={N_ref:.1f}, {len(epochs)} epoch(s) integrated, "
+              f"h={h}")
+
+    def _spectrum(gamma_ours):
+        gm = -2.0 * N_ref * float(gamma_ours) / (gamma_scale * float(ne_ref))
+        fs = moments.Spectrum(
+            moments.LinearSystem_1D.steady_state_1D(n, gamma=gm, h=h))
+        for nu_rel, T in epochs:
+            if T > 0:
+                fs.integrate([nu_rel], T, gamma=gm, h=h)
+        return np.asarray(fs)[1:n]          # segregating classes i = 1 .. n-1
+
+    neut = _spectrum(0.0)
+    neut = np.where(neut > 0, neut, np.nan)
+    tab = np.empty((len(gamma_grid), n - 1))
+    for gi, g in enumerate(gamma_grid):
+        tab[gi] = _spectrum(float(g)) / neut
+    tab = np.nan_to_num(tab, nan=0.0, posinf=0.0, neginf=0.0)
+    # p_keep is a THINNING probability: it can only remove. If some class comes
+    # out >1 (possible off-equilibrium), rescale the whole table so max = 1 --
+    # this preserves the SHAPE and pushes the lost count into a global factor,
+    # which --lambda-boost can compensate if the absolute count matters.
+    mx = float(np.nanmax(tab))
+    if mx > 1.0:
+        if verbose:
+            print(f"[prf-moments] max p_keep={mx:.3f} > 1 -> rescaling table "
+                  f"(thinning cannot ADD sites; shape preserved)")
+        tab = tab / mx
+    return np.clip(tab, 0.0, 1.0)
+
+
+def prf_selftest(n_haps, gamma_grid, baseline_msmc, ne_ref, gamma_scale, h=0.5):
+    """Compare the moments backend to the analytic one. Under a CONSTANT-Ne
+    history they must agree; a mismatch means the gamma convention or the
+    dominance is wrong, which would silently mis-scale every prune probability."""
+    an = build_prf_keep_table(n_haps, gamma_grid)
+    mo = build_prf_keep_table_moments(n_haps, gamma_grid, baseline_msmc, ne_ref,
+                                      gamma_scale, h=h, verbose=True)
+    ne_set = {float(e.ne) for e in getattr(baseline_msmc, "epochs", [])} or {ne_ref}
+    const = len(ne_set) <= 1
+    d = np.abs(an - mo)
+    print("=" * 66)
+    print("PRF BACKEND SELF-TEST" + ("  (constant Ne: backends MUST agree)"
+                                     if const else
+                                     "  (varying Ne: differences are EXPECTED)"))
+    print(f"  max |analytic - moments| = {d.max():.4f}   mean = {d.mean():.4f}")
+    for g in (2.0, 20.0, 200.0):
+        gi = int(np.argmin(np.abs(np.asarray(gamma_grid) - g)))
+        print(f"  gamma={g:6.1f}  i=1: an={an[gi,0]:.3f} mo={mo[gi,0]:.3f}   "
+              f"i=10: an={an[gi,9]:.4f} mo={mo[gi,9]:.4f}")
+    if const:
+        print("  VERDICT:", "PASS" if d.max() < 0.05 else
+              "FAIL - check --gamma-scale and -h against the SLiM convention")
+    else:
+        print("  (constant-Ne comparison unavailable; run once with a flat MSMC "
+              "file to validate the convention, then trust moments here)")
+    print("=" * 66)
+    return an, mo
+
+
+def prf_keep_prob(gamma, i, gamma_grid, table):
+    """Interpolate p_keep for scaled coefficient `gamma` at carrier count `i`."""
+    j = int(np.clip(i - 1, 0, table.shape[1] - 1))
+    return float(np.interp(gamma, gamma_grid, table[:, j]))
+
+
+def harmonic_mean_ne(baseline_msmc, fallback):
+    """Harmonic-mean Ne over the MSMC epochs -- the size that governs coalescence
+    (and hence gamma) when the demography varies. Constant history returns Ne."""
+    if baseline_msmc is None:
+        return float(fallback)
+    eps = sorted(baseline_msmc.epochs, key=lambda e: e.slim_gen_start)
+    if len(eps) <= 1:
+        return float(eps[0].ne) if eps else float(fallback)
+    bounds = [e.slim_gen_start for e in eps] + [float(baseline_msmc.sim_length)]
+    dur = np.diff(bounds)
+    ne = np.array([e.ne for e in eps], float)
+    ok = (dur > 0) & (ne > 0)
+    if not ok.any():
+        return float(fallback)
+    return float(dur[ok].sum() / (dur[ok] / ne[ok]).sum())
+
+
 def insertion_intensity(recomb_rate, log_lambda, gamma_r, recomb_typical, log_scale):
     """lambda_local(p) = lambda_global * exp(gamma_r * feature_r). gamma_r>0 ->
     more insertions where recombination is high."""
@@ -50,7 +236,8 @@ def insertion_intensity(recomb_rate, log_lambda, gamma_r, recomb_typical, log_sc
 
 
 def expansion_log_upsilon(a, b, recomb_rate, recomb_typical, log_scale,
-                          log_offset=0.0, clip_at_neutral=False):
+                          log_offset=0.0, clip_at_neutral=False,
+                          s_gain=1.0, alpha_gain=1.0):
     """log(upsilon) for a segment, where upsilon is the TOTAL size RATIO of the
     exponential size change (Xue et al.'s parameterisation), NOT a rate:
 
@@ -76,7 +263,18 @@ def expansion_log_upsilon(a, b, recomb_rate, recomb_typical, log_scale,
                 region is honest -- SLiM cannot distinguish those s values either.
     """
     fr = feature_r(recomb_rate, recomb_typical, log_scale)
-    lu = a + b * fr + log_offset
+    # GAINS (s_gain, alpha_gain) make the s -> upsilon map a POWER LAW instead of
+    # strictly proportional:
+    #     upsilon = (s_local / s_ref) ** s_gain          [global term]
+    # so s=1e-2 with s_ref=1e-3 gives upsilon = 10 at gain 1, 100 at gain 2, 1000
+    # at gain 3, ... The gain multiplies log upsilon, and log upsilon = 0 at
+    # s = s_ref is preserved for ANY gain -- the nested "no selection" anchor
+    # survives, which is what keeps the null exact.
+    # alpha_gain scales the RECOMB-CONTRAST term independently of the global one,
+    # so the alpha_r signal can be accentuated WITHOUT also inflating overall
+    # selection strength. (nu_duration scales both terms together and therefore
+    # cannot separate them; these gains can.)
+    lu = s_gain * (a + log_offset) + alpha_gain * (b * fr)
     if clip_at_neutral:
         lu = max(lu, 0.0)
     return lu
@@ -271,6 +469,33 @@ def build_demography(baseline_msmc, log_upsilon, Ne_fallback,
     return dem
 
 
+def _te_mutations_with_burst(ts, rate, theta, param_idx, seed):
+    """Lay TE markers at `rate` (scalar or RateMap), with a transposition BURST.
+
+    log10_t_start / log_duration / log_multiplier define a time window in which
+    the insertion rate is elevated. msprime places mutations on branches within
+    [start_time, end_time] and requires OLDER mutations to be added FIRST, so the
+    layering is baseline-old -> burst -> baseline-recent.
+    """
+    import msprime
+    t_start = 10.0 ** theta[param_idx["log10_t_start"]]
+    dur     = float(np.exp(theta[param_idx["log_duration"]]))
+    mult    = float(np.exp(theta[param_idx["log_multiplier"]]))
+    t_old, t_young = float(t_start), max(0.0, float(t_start) - dur)
+    if not (mult > 1.0 and dur > 0 and t_old > t_young):
+        return msprime.sim_mutations(ts, rate=rate, random_seed=seed)
+    m = msprime.sim_mutations(ts, rate=rate, start_time=t_old, random_seed=seed)
+    try:
+        boosted = rate * mult
+    except TypeError:                       # RateMap: rebuild scaled
+        boosted = msprime.RateMap(position=np.asarray(rate.position),
+                                  rate=np.asarray(rate.rate) * mult)
+    m = msprime.sim_mutations(m, rate=boosted, start_time=t_young,
+                              end_time=t_old, random_seed=seed, keep=True)
+    return msprime.sim_mutations(m, rate=rate, end_time=t_young,
+                                 random_seed=seed, keep=True)
+
+
 def simulate_window(theta, gw, n_haps, param_idx, cfg, n_segments, baseline_msmc,
                     mean_2ne, rng, nu_log_offset=0.0, nu_clip_neutral=False,
                     nu_start_time=1000.0, nu_duration=1000.0, nu_anchor="present"):
@@ -355,6 +580,75 @@ def simulate_window(theta, gw, n_haps, param_idx, cfg, n_segments, baseline_msmc
     # order. LD across block seams is broken; acceptable because the sims are
     # neutral coalescent and the proxy need not be exact. gamma_r still enters via
     # insertion_intensity at each block's local recomb (finer than window-mean).
+    # ======================================================================
+    # PRF-PRUNE MODE (default): purifying selection by per-TE removal.
+    #
+    # ONE tree over the whole window under the UNDISTORTED MSMC demography, so
+    # the neutral SNP features match SLiM instead of drifting under an expansion.
+    # TEs are laid neutrally, then each is pruned with the PRF keep-probability
+    # evaluated at ITS OWN local selection coefficient
+    #     s_local = exp(log_s_global + alpha_r * feature_r(local recomb))
+    # read at that TE's own position. alpha_r therefore acts at per-TE spatial
+    # resolution -- finer than the 100 kb blocks, with NO block seams and NO LD
+    # breakage. gamma_r acts through a TE-rate map on the same tree.
+    #
+    # ACCEPTED APPROXIMATION: the genealogy stays neutral, so there is no
+    # background-selection dip in the flanks of surviving TEs. he_carrier,
+    # tajD_carrier and especially hapext_carrier will therefore lack the local
+    # diversity reduction SLiM has. This is a smooth, monotone shortfall -- the
+    # kind fine-tuning absorbs -- and is far milder than the expansion proxy's
+    # 2-4 SD displacement of every SNP-diversity feature.
+    # ======================================================================
+    if cfg.get("prune_mode", False):
+        dem = build_demography(baseline_msmc, 0.0, cfg["Ne"],
+                               nu_start_time, nu_duration, nu_anchor)
+        if n_haps % 2 != 0:
+            raise ValueError(f"n_haps must be even; got {n_haps}")
+        seed = int(rng.integers(1, 2**31 - 1))
+        ts = msprime.sim_ancestry(
+            samples=n_haps // 2, demography=dem, ploidy=2,
+            sequence_length=seq_len, recombination_rate=ratemap,
+            random_seed=seed)
+
+        snp_rows, snp_pos = [], []
+        ts_snp = msprime.sim_mutations(ts, rate=mu_snp, random_seed=seed)
+        for var in ts_snp.variants():
+            g = var.genotypes.astype(np.int8)
+            c = int(g.sum())
+            if 0 < c < n_haps:
+                snp_rows.append(g); snp_pos.append(float(var.site.position))
+
+        # TE insertion rate varies along the window with local recomb (gamma_r)
+        rate_te = np.array([
+            insertion_intensity(rr[k], log_lambda, gamma_r, rtyp, lscale)
+            for k in range(len(seg_bp))], float)
+        te_rows, te_pos = [], []
+        n_pruned = 0
+        if np.any(rate_te > 0):
+            te_rm = msprime.RateMap(position=rp, rate=np.nan_to_num(rate_te))
+            ts_te = _te_mutations_with_burst(
+                ts, te_rm, theta, param_idx,
+                (seed ^ 0x5DEECE66) & 0x7FFFFFFF)
+            g_scale = float(cfg.get("gamma_scale", 4.0))
+            ne_eff  = float(cfg.get("prune_ne", 500.0))
+            gg, ptab = cfg["prf_gamma_grid"], cfg["prf_table"]
+            for var in ts_te.variants():
+                g = var.genotypes.astype(np.int8)
+                c = int(g.sum())
+                if not (0 < c < n_haps):
+                    continue
+                pos = float(var.site.position)
+                k = int(np.clip(np.searchsorted(rp, pos) - 1, 0, len(rr) - 1))
+                s_loc = float(np.exp(nu_a + nu_b * feature_r(rr[k], rtyp, lscale)))
+                gam = g_scale * ne_eff * s_loc
+                if rng.random() < prf_keep_prob(gam, c, gg, ptab):
+                    te_rows.append(np.where(g > 0, cfg["TE_STATE"], 0).astype(np.int8))
+                    te_pos.append(pos)
+                else:
+                    n_pruned += 1
+        cfg["_last_n_pruned"] = n_pruned
+        return te_rows, np.asarray(te_pos), snp_rows, np.asarray(snp_pos)
+
     n_blocks = max(1, int(np.ceil(seq_len / block_bp)))
     seed0 = int(rng.integers(1, 2**31 - 1))
 
@@ -374,7 +668,9 @@ def simulate_window(theta, gw, n_haps, param_idx, cfg, n_segments, baseline_msmc
         # local nu / demography from THIS block's recomb (alpha_r acts here)
         log_ups = float(expansion_log_upsilon(
             nu_a, nu_b, loc_r, rtyp, lscale,
-            log_offset=nu_log_offset, clip_at_neutral=nu_clip_neutral))
+            log_offset=nu_log_offset, clip_at_neutral=nu_clip_neutral,
+            s_gain=cfg.get("nu_s_gain", 1.0),
+            alpha_gain=cfg.get("nu_alpha_gain", 1.0)))
         dem = build_demography(baseline_msmc, log_ups, cfg["Ne"],
                                nu_start_time, nu_duration, nu_anchor)
 
@@ -463,7 +759,8 @@ def debug_window(theta, gw, n_haps, param_idx, cfg, baseline_msmc, mean_2ne,
     log_ups = float(expansion_log_upsilon(
         theta[param_idx["log_s_global"]], theta[param_idx["alpha_r"]],
         win_mean_r, rtyp, lscale,
-        log_offset=nu_log_offset, clip_at_neutral=nu_clip_neutral))
+        log_offset=nu_log_offset, clip_at_neutral=nu_clip_neutral,
+        s_gain=cfg.get("nu_s_gain", 1.0), alpha_gain=cfg.get("nu_alpha_gain", 1.0)))
     dem = build_demography(baseline_msmc, log_ups, cfg["Ne"],
                            nu_start_time, nu_duration, nu_anchor)
     L = float(gw.end - gw.start)
@@ -493,6 +790,9 @@ def debug_window(theta, gw, n_haps, param_idx, cfg, baseline_msmc, mean_2ne,
     print(f"  n_haps (samples): {n_haps}")
     print(f"  win_mean_recomb : {win_mean_r:.3e}")
     print(f"  Ne (present)    : {Ne_eff:.1f}   mu={mu:.3e}")
+    print(f"  gains           : s_gain={cfg.get('nu_s_gain',1.0):.2f}  "
+          f"alpha_gain={cfg.get('nu_alpha_gain',1.0):.2f}  "
+          f"(upsilon = (s/s_ref)**s_gain)")
     print(f"  log_upsilon     : {log_ups:+.3f}  (upsilon={np.exp(log_ups):.3f}, "
           f"r*2Ne={np.log(np.exp(log_ups))*2*Ne_eff/nu_duration:+.2f})")
     print(f"  demography epochs (msprime view):")
@@ -534,7 +834,8 @@ def debug_window(theta, gw, n_haps, param_idx, cfg, baseline_msmc, mean_2ne,
             lr = _mr(blo, bhi)
             lub = float(expansion_log_upsilon(
                 theta[param_idx["log_s_global"]], theta[param_idx["alpha_r"]],
-                lr, rtyp, lscale, log_offset=nu_log_offset, clip_at_neutral=nu_clip_neutral))
+                lr, rtyp, lscale, log_offset=nu_log_offset, clip_at_neutral=nu_clip_neutral,
+                s_gain=cfg.get("nu_s_gain", 1.0), alpha_gain=cfg.get("nu_alpha_gain", 1.0)))
             lus.append(lub)
             print(f"      block {bi}: local_recomb={lr:.2e} -> log_ups={lub:+.3f} "
                   f"(ups={np.exp(lub):.2f})")
@@ -553,6 +854,25 @@ def debug_window(theta, gw, n_haps, param_idx, cfg, baseline_msmc, mean_2ne,
             print(f"  --- TE BURST --- none (multiplier={mult:.2f}<=1); constant lambda")
     except Exception as e:
         print(f"  (block/burst introspection failed: {e})")
+    if cfg.get("prune_mode", False):
+        gsc = float(cfg.get("gamma_scale", 4.0)); nef = float(cfg.get("prune_ne", 500.0))
+        s_g = float(np.exp(theta[param_idx["log_s_global"]]))
+        a_r = float(theta[param_idx["alpha_r"]])
+        print(f"  --- PRF PRUNE (selection by per-TE removal; no nu distortion) ---")
+        print(f"      gamma = {gsc:g} * Ne({nef:.0f}) * s_local")
+        print(f"      s_global={s_g:.3e} -> gamma_global={gsc*nef*s_g:.2f}")
+        gg, ptab = cfg["prf_gamma_grid"], cfg["prf_table"]
+        print(f"      keep-prob at gamma_global: p(singleton)="
+              f"{prf_keep_prob(gsc*nef*s_g,1,gg,ptab):.3f}  "
+              f"p(i=10)={prf_keep_prob(gsc*nef*s_g,10,gg,ptab):.3f}  "
+              f"p(i=50)={prf_keep_prob(gsc*nef*s_g,50,gg,ptab):.4f}")
+        for _r in (1e-8, 1e-7, 1e-6):
+            _s = s_g * np.exp(a_r * feature_r(_r, rtyp, lscale))
+            print(f"      recomb={_r:.0e} -> s_local={_s:.2e} "
+                  f"gamma={gsc*nef*_s:7.2f} p(i=10)="
+                  f"{prf_keep_prob(gsc*nef*_s,10,gg,ptab):.3f}")
+        print(f"      -> alpha_r contrast now acts PER TE at its own position")
+        print(f"      TEs pruned this window: {cfg.get('_last_n_pruned','?')}")
     print(f"  --- SNPs ---")
     print(f"    realised segregating sites : {len(snp_pos)}")
     print(f"    Watterson E[S] (diploid 4Ne): {exp_S:.0f}")
@@ -650,7 +970,9 @@ def debug_window(theta, gw, n_haps, param_idx, cfg, baseline_msmc, mean_2ne,
     for s_val in np.geomspace(s_lo, s_hi, 6):
         lu = expansion_log_upsilon(np.log(s_val), 0.0, win_mean_r, rtyp, lscale,
                                    log_offset=nu_log_offset,
-                                   clip_at_neutral=nu_clip_neutral)
+                                   clip_at_neutral=nu_clip_neutral,
+                                   s_gain=cfg.get("nu_s_gain", 1.0),
+                                   alpha_gain=cfg.get("nu_alpha_gain", 1.0))
         r2ne = lu * 2 * Ne_eff / nu_duration
         tag = ""
         if abs(r2ne) > 20: tag = " (SATURATED - too strong to distinguish)"; saturated += 1
@@ -680,6 +1002,52 @@ def parse_args():
     p.add_argument("--n-windows",    type=int, default=20)
     p.add_argument("--block-size", type=int, default=100_000,
                    help="Sub-window block size in bp (default 100kb). Each block gets its own local recomb -> own nu -> own tree, giving alpha_r (the recomb-dependence of selection) within-window contrast. Set >= window-size to recover the old single-tree behaviour.")
+    p.add_argument("--prf-backend", choices=["analytic", "moments"],
+                   default="analytic",
+                   help="How p_keep is computed. 'analytic' uses the constant-Ne "
+                        "Wright-Fisher/PRF ratio -- exact for a flat history, and an "
+                        "approximation otherwise (it assumes selection's RELATIVE "
+                        "distortion is demography-independent). 'moments' integrates "
+                        "both the selected and neutral spectra through the ACTUAL "
+                        "MSMC history and takes their ratio, dropping that "
+                        "assumption; needs the `moments` package.")
+    p.add_argument("--prf-dominance", type=float, default=0.5,
+                   help="Dominance h for the moments backend (0.5 = additive). "
+                        "Match the SLiM sims.")
+    p.add_argument("--prf-selftest", action="store_true",
+                   help="Build BOTH backends and compare, then exit. Under a "
+                        "constant-Ne history they must agree; a mismatch means the "
+                        "gamma/dominance convention is wrong. Run this ONCE before "
+                        "trusting the moments backend.")
+    p.add_argument("--gamma-scale", type=float, default=4.0,
+                   help="gamma = GAMMA_SCALE * Ne * s_local, the scaled selection "
+                        "coefficient driving the PRF prune probability. 4.0 is the "
+                        "standard 4*Ne*s for genic/additive selection where s is the "
+                        "HETEROZYGOTE effect. MUST match the dominance convention of "
+                        "the SLiM sims being paired with (if SLiM uses homozygous s "
+                        "with h=0.5, pass 2.0).")
+    p.add_argument("--prune-ne", type=float, default=None,
+                   help="Ne used in gamma. Default: harmonic mean of the MSMC epochs "
+                        "(the size that governs coalescence when the history varies).")
+    p.add_argument("--s-gain", type=float, default=1.0,
+                   help="Exponent on the s -> upsilon map: upsilon = (s/s_ref)**s_gain. "
+                        "1.0 = strictly proportional (the old behaviour). 2.0 means "
+                        "s=1e-2 with s_ref=1e-3 gives upsilon=100 instead of 10. "
+                        "upsilon=1 at s=s_ref is preserved for any gain, so the null "
+                        "stays exactly nested. Raises TOTAL size change (unlike "
+                        "--nu-duration, which changes the window at fixed size change).")
+    p.add_argument("--alpha-gain", type=float, default=1.0,
+                   help="Multiplier on the alpha_r * feature_r term ONLY. Accentuates "
+                        "the recombination contrast without inflating overall selection "
+                        "strength -- the one thing --nu-duration cannot do, since it "
+                        "scales both terms together.")
+    p.add_argument("--theta-from", type=str, default=None,
+                   help="Draw theta from an EXISTING dataset instead of the prior, "
+                        "so msprime replicate i uses the SAME theta as SLiM sim i. "
+                        "Pass a dataset base (…/dataset -> reads <base>.theta.pt), a "
+                        ".theta.pt directly, or a .npy of theta vectors. Paired theta "
+                        "makes the comparison apples-to-apples: a feature difference "
+                        "is then the SIMULATOR, not a different draw.")
     p.add_argument("--theta", type=str, default=None,
                    help="Comma-separated theta to use INSTEAD of a random "
                         "draw, in PARAM_NAMES order. Lets you test a specific "
@@ -717,8 +1085,8 @@ def parse_args():
     p.add_argument("--window-manifest", type=str, default=None,
                    help="stratified window manifest from 00_sample_windows.py "
                         "(REQUIRED for sharded runs so windows are reproducible).")
-    p.add_argument("--param-mode", choices=["nu-direct", "s-proxy"],
-                   default="nu-direct",
+    p.add_argument("--param-mode", choices=["prf-prune", "nu-direct", "s-proxy"],
+                   default="prf-prune",
                    help="nu-direct: draw log_nu_global/nu_r over --nu-range into "
                         "the log_s_global/alpha_r slots; nu IS the parameter and "
                         "is mapped to selection post hoc by the SLiM calibration "
@@ -806,10 +1174,59 @@ def main():
     else:
         mean_2ne = 2.0 * getattr(CB, "NE", 10_000) * float(SIM_LENGTH)
 
-    cfg = dict(param_names=list(PARAM_NAMES), Ne=getattr(CB, "NE", 10_000), mu_snp=MU,
+    # paired-theta table (--theta-from): load once, index by replicate_id
+    _theta_table = None
+    if args.theta_from is not None:
+        _tp = Path(args.theta_from)
+        if _tp.suffix == ".npy":
+            _theta_table = np.asarray(np.load(_tp), dtype=np.float64)
+        else:
+            import torch as _torch
+            _cand = _tp if _tp.suffix == ".pt" else _tp.with_suffix(".theta.pt")
+            _m = _torch.load(_cand, map_location="cpu", weights_only=False)
+            _theta_table = np.asarray(_m["thetas"], dtype=np.float64)
+        if _theta_table.ndim != 2 or _theta_table.shape[1] != len(PARAM_NAMES):
+            sys.exit(f"--theta-from: expected (N,{len(PARAM_NAMES)}) thetas, got "
+                     f"{_theta_table.shape}. Wrong model or wrong dataset?")
+        print(f"[theta-from] {_theta_table.shape[0]} paired theta vectors "
+              f"from {args.theta_from}")
+
+    n_haps = getattr(CB, "N_HAPS", getattr(CB, "N_SAMPLES", 100))
+    # ---- PRF prune setup (default mode) ----
+    _prune = (args.param_mode == "prf-prune")
+    _prune_ne = (args.prune_ne if args.prune_ne is not None
+                 else harmonic_mean_ne(baseline_msmc, getattr(CB, "NE", 10_000)))
+    _gam_grid = np.concatenate([[0.0], np.geomspace(0.02, 2000.0, 96)])
+    if args.prf_selftest:
+        prf_selftest(n_haps, _gam_grid, baseline_msmc, _prune_ne,
+                     args.gamma_scale, h=args.prf_dominance)
+        return 0
+    if not _prune:
+        _prf_tab = None
+    elif args.prf_backend == "moments":
+        try:
+            _prf_tab = build_prf_keep_table_moments(
+                n_haps, _gam_grid, baseline_msmc, _prune_ne,
+                args.gamma_scale, h=args.prf_dominance)
+        except ImportError:
+            print("[prf] `moments` not installed -- falling back to the analytic "
+                  "backend (exact only for a constant-Ne history).", file=sys.stderr)
+            _prf_tab = build_prf_keep_table(n_haps, _gam_grid)
+    else:
+        _prf_tab = build_prf_keep_table(n_haps, _gam_grid)
+    if _prune:
+        print(f"[prf-prune] gamma = {args.gamma_scale:g} * Ne * s_local, "
+              f"Ne={_prune_ne:.1f} (harmonic mean)  -> "
+              f"gamma spans [{args.gamma_scale*_prune_ne*3e-4:.2f}, "
+              f"{args.gamma_scale*_prune_ne*0.1:.0f}] across the s prior")
+
+    cfg = dict(param_names=list(PARAM_NAMES), block_size_bp=args.block_size,
+               prune_mode=_prune, gamma_scale=args.gamma_scale,
+               prune_ne=_prune_ne, prf_gamma_grid=_gam_grid, prf_table=_prf_tab,
+               nu_s_gain=args.s_gain, nu_alpha_gain=args.alpha_gain,
+               Ne=getattr(CB, "NE", 10_000), mu_snp=MU,
                recomb_typical=CB.RECOMB_TYPICAL, recomb_log_scale=CB.RECOMB_LOG_SCALE,
                TE_STATE=TE_STATE)
-    n_haps = getattr(CB, "N_HAPS", getattr(CB, "N_SAMPLES", 100))
     nu_lo, nu_hi   = [float(x) for x in args.nu_range.split(",")]
     nur_lo, nur_hi = [float(x) for x in args.nu_r_range.split(",")]
 
@@ -843,7 +1260,13 @@ def main():
         # (te_dfe/prior_context.py:82: sample(rng, ne_harmonic=None)), NOT seed=.
         # Match 01_simulate_shard.py: build a default_rng from a SeedSequence so
         # the draw is reproducible and independent per replicate.
-        if args.theta is not None:
+        if args.theta_from is not None:
+            if replicate_id >= len(_theta_table):
+                print(f"[rep{replicate_id}] beyond theta table "
+                      f"({len(_theta_table)} rows) - skipping")
+                continue
+            theta = _theta_table[replicate_id].copy()
+        elif args.theta is not None:
             theta = np.asarray([float(x) for x in args.theta.split(",")],
                                dtype=np.float64).reshape(-1)
             if len(theta) != len(PARAM_NAMES):
@@ -994,3 +1417,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

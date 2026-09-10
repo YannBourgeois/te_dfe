@@ -480,3 +480,4 @@ def _collate_legacy(out_base, files, n_loaded, obs_shape, theta_shape):
 
 if __name__ == "__main__":
     sys.exit(main())
+
