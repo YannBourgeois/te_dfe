@@ -176,6 +176,97 @@ def build_prf_keep_table_moments(n_haps, gamma_grid, baseline_msmc, ne_ref,
     return np.clip(tab, 0.0, 1.0)
 
 
+def build_prf_keep_table_moments_aged(n_haps, gamma_grid, age_edges,
+                                      baseline_msmc, ne_ref, gamma_scale,
+                                      h=0.5, verbose=True):
+    """AGE x FREQUENCY keep-probabilities.
+
+        p_keep(gamma, w, i) = E[S_{i,w} | gamma] / E[S_{i,w} | 0]
+
+    w indexes an age window (by allele ORIGIN time), i the carrier count. Same
+    object as build_prf_keep_table_moments with the age axis KEPT instead of
+    summed. Spectra come from moments.Demes.SFS(..., mutation_time_windows=edges)
+    through the real MSMC history, and the gamma convention is IDENTICAL to the
+    marginal moments backend
+        gm = -2 * N_ref * gamma / (gamma_scale * ne_ref)
+    so the age-partitioned spectra sum back to the marginal table (verified:
+    max rel err ~1e-5 at gamma=0, ~3e-4 at moderate selection). Thinning by
+    (w, i) makes SURVIVING TEs match selection's age-within-frequency structure,
+    which is exactly what the age-partitioned fit reads; frequency-only thinning
+    leaves that joint neutral.
+
+    Returns (len(gamma_grid), n_win, n_haps - 1); n_win = len(finite age_edges).
+    """
+    import moments
+    from te_dfe.moments_dfe import (demes_graph_from_msmc,
+                                    _patch_moments_mtw_gamma,
+                                    AGE_WINDOW_GAMMA_MAX, _AGE_WINDOW_SANE_SUM)
+    n = int(n_haps)
+    _patch_moments_mtw_gamma()                     # gamma + mtw crash fix
+    graph = demes_graph_from_msmc(baseline_msmc, ne_fallback=ne_ref)
+    N_ref = float(graph["pop"].epochs[0].start_size)      # graph reference size
+    edges = np.asarray(age_edges, float)
+    if edges.size and np.isinf(edges[-1]):
+        edges = edges[:-1]                         # moments runs last edge -> inf
+    n_win = len(edges)
+    if verbose:
+        print(f"[prf-aged] N_ref={N_ref:.1f}, {n_win} age windows "
+              f"(edges={edges.tolist()}), h={h}")
+
+    def _spectra(gamma_ours):
+        gm = -2.0 * N_ref * float(gamma_ours) / (gamma_scale * float(ne_ref))
+        gm = float(np.clip(gm, -AGE_WINDOW_GAMMA_MAX, AGE_WINDOW_GAMMA_MAX))
+
+        def _call(g):
+            fs = moments.Demes.SFS(graph, sampled_demes=["pop"],
+                                   sample_sizes=[n], gamma=g, h=h, theta=1.0,
+                                   mutation_time_windows=edges)
+            return np.array([np.asarray(f, float)[1:n] for f in fs])
+
+        # The OLD windows diverge first, finite-valued, so catch by MAGNITUDE and
+        # back off gamma until sane. This is the strong-selection ceiling: past it
+        # the spectra are all-singletons anyway, so the thinning is unchanged.
+        out = _call(gm); tries = 0
+        while (not np.isfinite(out).all()
+               or out.sum(axis=1).max() > _AGE_WINDOW_SANE_SUM) \
+                and tries < 15 and abs(gm) > 1e-6:
+            gm *= 0.8; out = _call(gm); tries += 1
+        return np.nan_to_num(np.clip(out, 0.0, None), nan=0.0, posinf=0.0)
+
+    neut = _spectra(0.0)
+    # reliability: a cell holds non-negligible NEUTRAL count within its window.
+    # The old/high-frequency corner is legitimately near-empty, so dividing the
+    # (also near-zero) selected count by it gives noise that can blow up to huge
+    # finite ratios -- which a global max-rescale would let hijack the whole table.
+    with np.errstate(invalid="ignore"):
+        win_max = np.nanmax(np.where(neut > 0, neut, 0.0), axis=1, keepdims=True)
+    reliable = (neut > 0) & (neut >= 1e-4 * np.where(win_max > 0, win_max, np.inf))
+    neut_safe = np.where(neut > 0, neut, np.nan)
+    tab = np.empty((len(gamma_grid), n_win, n - 1))
+    for gi, g in enumerate(gamma_grid):
+        tab[gi] = _spectra(float(g)) / neut_safe
+    # p_keep is a probability, monotone DECREASING in frequency (Sawyer-Hartl),
+    # and <= 1 for deleterious selection. Clip the reliable cells to [0, 1], then
+    # FORWARD-FILL the negligible-neutral tail with the last reliable value: that
+    # is the correct monotone floor (small under selection, ~1 under neutrality),
+    # and it avoids both the tiny-denominator blow-up and a global rescale that a
+    # single noisy cell could dominate. Between-window structure is untouched
+    # because nothing is normalised per window.
+    for gi in range(tab.shape[0]):
+        for w in range(n_win):
+            row = tab[gi, w]
+            rel = reliable[w]
+            if not rel.any():
+                row[:] = 0.0
+                continue
+            last = float(np.clip(row[np.argmax(rel)], 0.0, 1.0))  # first reliable
+            for j in range(len(row)):
+                if rel[j] and np.isfinite(row[j]):
+                    last = float(np.clip(row[j], 0.0, 1.0))
+                row[j] = last
+    return np.clip(np.nan_to_num(tab, nan=0.0, posinf=0.0, neginf=0.0), 0.0, 1.0)
+
+
 def prf_selftest(n_haps, gamma_grid, baseline_msmc, ne_ref, gamma_scale, h=0.5):
     """Compare the moments backend to the analytic one. Under a CONSTANT-Ne
     history they must agree; a mismatch means the gamma convention or the
@@ -209,6 +300,21 @@ def prf_keep_prob(gamma, i, gamma_grid, table):
     """Interpolate p_keep for scaled coefficient `gamma` at carrier count `i`."""
     j = int(np.clip(i - 1, 0, table.shape[1] - 1))
     return float(np.interp(gamma, gamma_grid, table[:, j]))
+
+
+def prf_keep_prob_aged(gamma, i, age, gamma_grid, table, age_edges):
+    """p_keep for (scaled coeff gamma, carrier count i, allele age in gens).
+    age is binned into the windows of age_edges (finite lower edges, last -> inf),
+    matching the aged table's construction; unknown age -> oldest window."""
+    edges = np.asarray(age_edges, float)
+    if edges.size and np.isinf(edges[-1]):
+        edges = edges[:-1]
+    if not np.isfinite(age):
+        age = edges[-1] if edges.size else 0.0
+    w = int(np.clip(np.searchsorted(edges, age, side="right") - 1,
+                    0, table.shape[1] - 1))
+    j = int(np.clip(i - 1, 0, table.shape[2] - 1))
+    return float(np.interp(gamma, gamma_grid, table[:, w, j]))
 
 
 def harmonic_mean_ne(baseline_msmc, fallback):
@@ -453,8 +559,8 @@ def build_demography(baseline_msmc, log_upsilon, Ne_fallback,
     # same to_msprime_events(), therefore inherited NO ancestral size: its deep
     # history settled at N_old_bl (the ~t_old MSMC size) instead of ancestral_ne.
     # Since E[SNPs] = mu * total_branch_length and most branch length lives in the
-    # deep coalescent, a wrong ancestral size shifts SNP density systematically --
-    # exactly the msprime-vs-SLiM boxplot divergence. Anchor it to ancestral_ne at
+    # deep coalescent, a wrong ancestral size shifts SNP density systematically.
+    # Anchor it to ancestral_ne at
     # the oldest epoch boundary so both simulators coalesce under the same size.
     if baseline_msmc is not None:
         anc_ne = float(getattr(baseline_msmc, "ancestral_ne", N_old_bl))
@@ -631,7 +737,17 @@ def simulate_window(theta, gw, n_haps, param_idx, cfg, n_segments, baseline_msmc
                 (seed ^ 0x5DEECE66) & 0x7FFFFFFF)
             g_scale = float(cfg.get("gamma_scale", 4.0))
             ne_eff  = float(cfg.get("prune_ne", 500.0))
-            gg, ptab = cfg["prf_gamma_grid"], cfg["prf_table"]
+            gg      = cfg["prf_gamma_grid"]
+            aged    = cfg.get("prf_aged", False)
+            ptab    = cfg["prf_table_aged"] if aged else cfg["prf_table"]
+            aedges  = np.asarray(cfg["prf_age_edges"], float) if aged else None
+            # optional realized-thinning bookkeeping (only under --debug); records
+            # kept/pruned counts by (age window, carrier count) to confirm the
+            # sim reproduces the keep-prob table.
+            dbg = bool(cfg.get("prune_debug", False))
+            n_win = (len(aedges) if (aged and aedges is not None) else 1)
+            kept_h = np.zeros((n_win, n_haps - 1)) if dbg else None
+            prun_h = np.zeros((n_win, n_haps - 1)) if dbg else None
             for var in ts_te.variants():
                 g = var.genotypes.astype(np.int8)
                 c = int(g.sum())
@@ -641,11 +757,30 @@ def simulate_window(theta, gw, n_haps, param_idx, cfg, n_segments, baseline_msmc
                 k = int(np.clip(np.searchsorted(rp, pos) - 1, 0, len(rr) - 1))
                 s_loc = float(np.exp(nu_a + nu_b * feature_r(rr[k], rtyp, lscale)))
                 gam = g_scale * ne_eff * s_loc
-                if rng.random() < prf_keep_prob(gam, c, gg, ptab):
+                if aged:
+                    # allele ORIGIN time = the TE's mutation time (gens ago); the
+                    # OLDEST mutation at the site is the original insertion.
+                    age = max((m.time for m in var.site.mutations), default=np.nan)
+                    p_keep = prf_keep_prob_aged(gam, c, age, gg, ptab, aedges)
+                else:
+                    p_keep = prf_keep_prob(gam, c, gg, ptab)
+                kept = (rng.random() < p_keep)
+                if kept:
                     te_rows.append(np.where(g > 0, cfg["TE_STATE"], 0).astype(np.int8))
                     te_pos.append(pos)
                 else:
                     n_pruned += 1
+                if dbg:
+                    if aged:
+                        _age = age if np.isfinite(age) else aedges[-1]
+                        wi = int(np.clip(np.searchsorted(aedges, _age, side="right")
+                                         - 1, 0, n_win - 1))
+                    else:
+                        wi = 0
+                    (kept_h if kept else prun_h)[wi, c - 1] += 1
+            if dbg:
+                cfg["_last_prune_kept"] = kept_h
+                cfg["_last_prune_pruned"] = prun_h
         cfg["_last_n_pruned"] = n_pruned
         return te_rows, np.asarray(te_pos), snp_rows, np.asarray(snp_pos)
 
@@ -745,6 +880,7 @@ def debug_window(theta, gw, n_haps, param_idx, cfg, baseline_msmc, mean_2ne,
     """
     import msprime
     rng = np.random.default_rng(12345)
+    cfg["prune_debug"] = True          # collect realized age x freq thinning counts
     te_rows, te_pos, snp_rows, snp_pos = simulate_window(
         theta, gw, n_haps, param_idx, cfg, 1, baseline_msmc, mean_2ne, rng,
         nu_log_offset, nu_clip_neutral, nu_start_time, nu_duration, nu_anchor)
@@ -858,20 +994,62 @@ def debug_window(theta, gw, n_haps, param_idx, cfg, baseline_msmc, mean_2ne,
         gsc = float(cfg.get("gamma_scale", 4.0)); nef = float(cfg.get("prune_ne", 500.0))
         s_g = float(np.exp(theta[param_idx["log_s_global"]]))
         a_r = float(theta[param_idx["alpha_r"]])
+        gam_g = gsc * nef * s_g
+        gg = cfg["prf_gamma_grid"]
+        aged = cfg.get("prf_aged", False)
         print(f"  --- PRF PRUNE (selection by per-TE removal; no nu distortion) ---")
-        print(f"      gamma = {gsc:g} * Ne({nef:.0f}) * s_local")
-        print(f"      s_global={s_g:.3e} -> gamma_global={gsc*nef*s_g:.2f}")
-        gg, ptab = cfg["prf_gamma_grid"], cfg["prf_table"]
-        print(f"      keep-prob at gamma_global: p(singleton)="
-              f"{prf_keep_prob(gsc*nef*s_g,1,gg,ptab):.3f}  "
-              f"p(i=10)={prf_keep_prob(gsc*nef*s_g,10,gg,ptab):.3f}  "
-              f"p(i=50)={prf_keep_prob(gsc*nef*s_g,50,gg,ptab):.4f}")
-        for _r in (1e-8, 1e-7, 1e-6):
-            _s = s_g * np.exp(a_r * feature_r(_r, rtyp, lscale))
-            print(f"      recomb={_r:.0e} -> s_local={_s:.2e} "
-                  f"gamma={gsc*nef*_s:7.2f} p(i=10)="
-                  f"{prf_keep_prob(gsc*nef*_s,10,gg,ptab):.3f}")
-        print(f"      -> alpha_r contrast now acts PER TE at its own position")
+        print(f"      gamma = {gsc:g} * Ne({nef:.0f}) * s_local   "
+              f"[{'AGE x FREQUENCY' if aged else 'FREQUENCY-ONLY'} thinning]")
+        print(f"      s_global={s_g:.3e} -> gamma_global={gam_g:.2f}")
+        if not aged:
+            ptab = cfg["prf_table"]
+            print(f"      keep-prob at gamma_global: p(singleton)="
+                  f"{prf_keep_prob(gam_g,1,gg,ptab):.3f}  "
+                  f"p(i=10)={prf_keep_prob(gam_g,10,gg,ptab):.3f}  "
+                  f"p(i=50)={prf_keep_prob(gam_g,50,gg,ptab):.4f}")
+            for _r in (1e-8, 1e-7, 1e-6):
+                _s = s_g * np.exp(a_r * feature_r(_r, rtyp, lscale))
+                print(f"      recomb={_r:.0e} -> s_local={_s:.2e} "
+                      f"gamma={gsc*nef*_s:7.2f} p(i=10)="
+                      f"{prf_keep_prob(gsc*nef*_s,10,gg,ptab):.3f}")
+            print(f"      -> alpha_r contrast now acts PER TE at its own position")
+        else:
+            ptab = cfg["prf_table_aged"]                # (n_gamma, n_win, n-1)
+            aedges = np.asarray(cfg["prf_age_edges"], float)
+            n_win = ptab.shape[1]
+            cols = [c for c in (1, 2, 5, 10, 20, 50) if c <= n_haps - 1]
+            def _wlab(w):
+                lo = aedges[w]
+                hi = aedges[w + 1] if w + 1 < len(aedges) else np.inf
+                return f"[{lo:.0f},{'inf' if np.isinf(hi) else f'{hi:.0f}'})"
+            print(f"      keep-prob table p_keep(gamma_global, age win, carrier i)")
+            print(f"        the WHOLE point: p_keep should FALL along a row (with i)")
+            print(f"        AND down a column (older windows prune common harder)")
+            hdr = "        age window".ljust(24) + "".join(f"i={c:<7d}" for c in cols)
+            print(hdr)
+            for w in range(n_win):
+                row = "        " + _wlab(w).ljust(16)
+                for c in cols:
+                    row += f"{prf_keep_prob_aged(gam_g,c,aedges[w],gg,ptab,aedges):<9.3f}"
+                print(row)
+            # realized thinning from THIS window's actual draws
+            kept = cfg.get("_last_prune_kept"); prun = cfg.get("_last_prune_pruned")
+            if kept is not None and prun is not None:
+                tot = kept + prun
+                print(f"      realized thinning this window (kept / total by age x freq):")
+                print("        age window".ljust(24) + "".join(f"i={c:<7d}" for c in cols)
+                      + "n_kept   n_tot")
+                for w in range(min(n_win, kept.shape[0])):
+                    row = "        " + _wlab(w).ljust(16)
+                    for c in cols:
+                        j = c - 1
+                        t = tot[w, j]; kp = kept[w, j]
+                        row += (f"{kp/t:<9.2f}" if t > 0 else f"{'--':<9}")
+                    row += f"{int(kept[w].sum()):<9d}{int(tot[w].sum()):<d}"
+                    print(row)
+                print(f"        (realized fractions should track the table above; "
+                      f"noisy where n_tot is small)")
+            print(f"      -> alpha_r contrast acts PER TE; age acts via origin time")
         print(f"      TEs pruned this window: {cfg.get('_last_n_pruned','?')}")
     print(f"  --- SNPs ---")
     print(f"    realised segregating sites : {len(snp_pos)}")
@@ -1014,6 +1192,20 @@ def parse_args():
     p.add_argument("--prf-dominance", type=float, default=0.5,
                    help="Dominance h for the moments backend (0.5 = additive). "
                         "Match the SLiM sims.")
+    p.add_argument("--prf-age-edges", type=str, default="0,25,50,100,200,400,800",
+                   help="Age-window LOWER edges (generations, comma-separated) for "
+                        "AGE x FREQUENCY thinning; the last window runs to infinity. "
+                        "Non-empty (default) turns on age-resolved pruning: each TE "
+                        "is kept with p_keep(gamma, age-window, carrier-count), so "
+                        "surviving TEs match selection's age-WITHIN-frequency "
+                        "structure, not just its marginal SFS. Needs `moments`; the "
+                        "empty string reverts to frequency-only. Bins may be finer "
+                        "than the fit's (each TE has a continuous age). NOTE: deeper "
+                        "edges LOWER the resolvable-selection ceiling, because the "
+                        "terminal [last,inf) window destabilises the diffusion first "
+                        "(same tradeoff as the age-partitioned fit); past that the "
+                        "back-off clamps, which is benign for thinning since strong "
+                        "selection is all-singletons anyway.")
     p.add_argument("--prf-selftest", action="store_true",
                    help="Build BOTH backends and compare, then exit. Under a "
                         "constant-Ne history they must agree; a mismatch means the "
@@ -1214,8 +1406,30 @@ def main():
             _prf_tab = build_prf_keep_table(n_haps, _gam_grid)
     else:
         _prf_tab = build_prf_keep_table(n_haps, _gam_grid)
+    # AGE x FREQUENCY thinning (default ON; needs moments). Falls back to the
+    # marginal frequency-only table if disabled or moments is unavailable.
+    _age_edges = None
+    _prf_tab_aged = None
+    _aged = False
+    if _prune and args.prf_age_edges.strip():
+        _age_edges = np.array([float(x) for x in args.prf_age_edges.split(",")],
+                              float)
+        if _age_edges.size == 0 or _age_edges[0] != 0.0:
+            _age_edges = np.concatenate([[0.0], _age_edges])
+        try:
+            _prf_tab_aged = build_prf_keep_table_moments_aged(
+                n_haps, _gam_grid, _age_edges, baseline_msmc, _prune_ne,
+                args.gamma_scale, h=args.prf_dominance)
+            _aged = True
+        except ImportError:
+            print("[prf-aged] `moments` not installed; age x frequency thinning "
+                  "needs it -- falling back to frequency-only.", file=sys.stderr)
+    # finite edges the per-TE lookup bins against (drop a trailing inf if present)
+    _age_edges_fin = (_age_edges[:-1] if (_age_edges is not None and _age_edges.size
+                      and np.isinf(_age_edges[-1])) else _age_edges)
     if _prune:
-        print(f"[prf-prune] gamma = {args.gamma_scale:g} * Ne * s_local, "
+        print(f"[prf-prune] {'AGE x FREQUENCY' if _aged else 'FREQUENCY-ONLY'} "
+              f"thinning; gamma = {args.gamma_scale:g} * Ne s_local, "
               f"Ne={_prune_ne:.1f} (harmonic mean)  -> "
               f"gamma spans [{args.gamma_scale*_prune_ne*3e-4:.2f}, "
               f"{args.gamma_scale*_prune_ne*0.1:.0f}] across the s prior")
@@ -1223,6 +1437,8 @@ def main():
     cfg = dict(param_names=list(PARAM_NAMES), block_size_bp=args.block_size,
                prune_mode=_prune, gamma_scale=args.gamma_scale,
                prune_ne=_prune_ne, prf_gamma_grid=_gam_grid, prf_table=_prf_tab,
+               prf_aged=_aged, prf_table_aged=_prf_tab_aged,
+               prf_age_edges=_age_edges_fin,
                nu_s_gain=args.s_gain, nu_alpha_gain=args.alpha_gain,
                Ne=getattr(CB, "NE", 10_000), mu_snp=MU,
                recomb_typical=CB.RECOMB_TYPICAL, recomb_log_scale=CB.RECOMB_LOG_SCALE,
@@ -1417,4 +1633,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
