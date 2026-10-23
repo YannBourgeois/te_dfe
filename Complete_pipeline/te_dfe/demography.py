@@ -147,36 +147,36 @@ class MSMCDemography:
                 f.write(f"{ep.slim_gen_start}\t{ep.ne}\n")
 
     def to_msprime_events(self):
-    """Full time-ago demography for msprime: (present_size, events).
-
-    Returns the present-day population size and a list of
-    msprime.PopulationParametersChange events (time in generations-ago) that,
-    applied on top of that present size, reproduce the whole history.
-
-    Convention (the thing that is easy to get wrong): epochs are stored in
-    FORWARD time as (slim_gen_start, ne), sorted ascending, so epochs[-1] is the
-    MOST RECENT. Going BACKWARD from the present, the size starts at the most
-    recent epoch's Ne and, at each boundary tau = sim_length - epochs[i].
-    slim_gen_start, switches to the OLDER neighbour epochs[i-1].ne. The i=1
-    boundary carries the ancestral Ne, so the ancestral size is INCLUDED here
-    (callers must NOT add a separate ancestral floor, and must set the present
-    size to the returned present_size, NOT to ancestral_ne).
-    """
-    eps = sorted(self.epochs, key=lambda e: e.slim_gen_start)
-    present_size = int(eps[-1].ne)
-    events = []
-    for i in range(1, len(eps)):
-        t_ago = self.sim_length - eps[i].slim_gen_start
-        if t_ago <= 0:
-            continue
-        events.append(
-            msprime.PopulationParametersChange(
-                time=t_ago,
-                initial_size=eps[i - 1].ne,   # OLDER neighbour
-                population=0,
-            )
-        )
-    return present_size, events
+        """Full time-ago demography for msprime: (present_size, events).
+        
+         Returns the present-day population size and a list of
+         msprime.PopulationParametersChange events (time in generations-ago) that,
+         applied on top of that present size, reproduce the whole history.
+        
+        Convention (the thing that is easy to get wrong): epochs are stored in
+        FORWARD time as (slim_gen_start, ne), sorted ascending, so epochs[-1] is the
+        MOST RECENT. Going BACKWARD from the present, the size starts at the most
+        recent epoch's Ne and, at each boundary tau = sim_length - epochs[i].
+        slim_gen_start, switches to the OLDER neighbour epochs[i-1].ne. The i=1
+        boundary carries the ancestral Ne, so the ancestral size is INCLUDED here
+        (callers must NOT add a separate ancestral floor, and must set the present
+        size to the returned present_size, NOT to ancestral_ne).
+        """
+        eps = sorted(self.epochs, key=lambda e: e.slim_gen_start)
+        present_size = int(eps[-1].ne)
+        events = []
+        for i in range(1, len(eps)):
+            t_ago = self.sim_length - eps[i].slim_gen_start
+            if t_ago <= 0:
+               continue
+            events.append(
+                  msprime.PopulationParametersChange(
+                  time=t_ago,
+                  initial_size=eps[i - 1].ne,   # OLDER neighbour
+                  population=0,
+               )
+           )
+        return present_size, events
 
     def __repr__(self):
         return (f"MSMCDemography(n_epochs={len(self.epochs)}, "
