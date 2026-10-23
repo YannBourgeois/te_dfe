@@ -528,9 +528,15 @@ def build_demography(baseline_msmc, log_upsilon, Ne_fallback,
     else:
         dem.add_population(name="pop", initial_size=N_present, growth_rate=0.0)
 
-    # to_msprime_events() returns msprime.PopulationParametersChange OBJECTS
-    # (time-ago), NOT dicts -- read .time, and re-attach by copying fields.
-    events = baseline_msmc.to_msprime_events() if baseline_msmc is not None else []
+    # to_msprime_events() now returns (present_size, events): the complete
+    # time-ago history, present size first, each boundary carrying the OLDER
+    # neighbour's Ne and the ancestral switch INCLUDED. We only need the events
+    # here (the window-splice sets the present/ancestral sizes itself); present
+    # size is taken from _msmc_size_at above, which agrees with present_size.
+    if baseline_msmc is not None:
+        _present_size, events = baseline_msmc.to_msprime_events()
+    else:
+        events = []
 
     def _add(ev):
         dem.add_population_parameters_change(
@@ -558,18 +564,16 @@ def build_demography(baseline_msmc, log_upsilon, Ne_fallback,
     # because recapitation sets it via initial_size. build_demography, using the
     # same to_msprime_events(), therefore inherited NO ancestral size: its deep
     # history settled at N_old_bl (the ~t_old MSMC size) instead of ancestral_ne.
-    # Since E[SNPs] = mu * total_branch_length and most branch length lives in the
-    # deep coalescent, a wrong ancestral size shifts SNP density systematically.
-    # Anchor it to ancestral_ne at
-    # the oldest epoch boundary so both simulators coalesce under the same size.
-    if baseline_msmc is not None:
-        anc_ne = float(getattr(baseline_msmc, "ancestral_ne", N_old_bl))
-        # oldest epoch boundary in time-ago (sim_length - oldest slim_gen_start);
-        # place the floor just past t_old if the epochs are all younger.
-        _eps = sorted(baseline_msmc.epochs, key=lambda e: e.slim_gen_start)
-        t_anc = max(t_old, float(baseline_msmc.sim_length) - _eps[0].slim_gen_start)
-        dem.add_population_parameters_change(
-            time=t_anc, initial_size=anc_ne, growth_rate=0.0, population="pop")
+    #
+    # NOTE: the former "ANCESTRAL FLOOR" workaround that lived here has been
+    # REMOVED. It existed only because the old to_msprime_events() skipped the
+    # ancestral epoch and never emitted the switch to ancestral_ne, so the deep
+    # history had to be pinned by hand at tau ~ sim_length. The corrected
+    # to_msprime_events() now emits the ancestral switch at its TRUE boundary
+    # (sim_length - epochs[1].slim_gen_start), so the deep size is set correctly
+    # by the baseline-older-than-window loop above; a floor at tau ~ sim_length
+    # would override that and, for a recent bottleneck, wrongly stretch the
+    # bottleneck Ne back to the present-1 generation.
 
     dem.sort_events()
     return dem

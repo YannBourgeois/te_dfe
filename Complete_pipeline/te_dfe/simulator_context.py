@@ -199,14 +199,14 @@ def postprocess_ts(trees_path, window: GenomicWindow,
     demog = msprime.Demography()
     demog.add_population(name="pop_0", initial_size=1)
     demog.add_population(name="p1", initial_size=demography.ancestral_ne)
-    for ev in demography.to_msprime_events():
-        demog.add_population_parameters_change(
-            time=ev.time, initial_size=ev.initial_size, population="p1",
-        )
+    #for ev in demography.to_msprime_events(): #useless loop for recapitation
+    #    demog.add_population_parameters_change(
+    #        time=ev.time, initial_size=ev.initial_size, population="p1",
+    #    )
     ts = pyslim.recapitate(
         ts,
         recombination_rate=window.recomb_map,
-        demography=demog,
+        ancestral_Ne = demography.ancestral_ne / Q, #demography=demog,
         random_seed=seed,
     )
 
@@ -687,3 +687,4 @@ class DFEBurstSimulator:
                 f"--- stdout ---\n{result.stdout}\n"
                 f"--- stderr ---\n{result.stderr}\n"
             )
+

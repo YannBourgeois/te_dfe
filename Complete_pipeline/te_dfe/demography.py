@@ -81,13 +81,13 @@ class MSMCDemography:
                 # MSMC2 output columns:
                 #   [0] time_index, [1] left_time_boundary,
                 #   [2] right_time_boundary, [3] lambda
-                # We use left_time_boundary as the epoch start time
+                # We use right_time_boundary as the epoch start time
                 # (in mu-scaled units) and lambda as the inverse coalescence
                 # rate. Convert: Ne = 1 / (2 * mu * lambda).
                 if len(parts) < 4:
                     continue
                 try:
-                    times_msmc.append(float(parts[1]))   # left_time_boundary
+                    times_msmc.append(float(parts[2]))   # right_time_boundary
                     lambdas.append(float(parts[3]))      # lambda
                 except ValueError:
                     continue
@@ -101,7 +101,7 @@ class MSMCDemography:
         ne_values  = np.clip(1.0 / (2.0 * mu * lambdas), min_ne, max_ne).astype(int)
         t_gen_ago  = times_msmc / mu
 
-        # MSMC rows are sorted by time_left ascending: oldest is last
+        # MSMC rows are sorted by time_right ascending: oldest is last
         # Convert each row to a SLiM forward generation
         epochs       = []
         ancestral_ne = int(ne_values[-1])
@@ -146,31 +146,37 @@ class MSMCDemography:
             for ep in self.epochs:
                 f.write(f"{ep.slim_gen_start}\t{ep.ne}\n")
 
-    def to_msprime_events(self) -> list:
-        """
-        Return list of msprime PopulationParametersChange events
-        for use in recapitation. Time is in 'time-ago' units.
+    def to_msprime_events(self):
+    """Full time-ago demography for msprime: (present_size, events).
 
-        Note: the first epoch (slim_gen_start = 1) corresponds to the
-        ancestral Ne which is set separately via ancestral_Ne in
-        recapitate(). We therefore skip it here to avoid duplicate
-        specification.
-        """
-        events = []
-        for ep in self.epochs:
-            if ep.slim_gen_start <= 1:
-                continue   # skip the ancestral epoch (handled by ancestral_Ne)
-            t_ago = self.sim_length - ep.slim_gen_start
-            if t_ago <= 0:
-                continue
-            events.append(
-                msprime.PopulationParametersChange(
-                    time=t_ago,
-                    initial_size=ep.ne,
-                    population=0,
-                )
+    Returns the present-day population size and a list of
+    msprime.PopulationParametersChange events (time in generations-ago) that,
+    applied on top of that present size, reproduce the whole history.
+
+    Convention (the thing that is easy to get wrong): epochs are stored in
+    FORWARD time as (slim_gen_start, ne), sorted ascending, so epochs[-1] is the
+    MOST RECENT. Going BACKWARD from the present, the size starts at the most
+    recent epoch's Ne and, at each boundary tau = sim_length - epochs[i].
+    slim_gen_start, switches to the OLDER neighbour epochs[i-1].ne. The i=1
+    boundary carries the ancestral Ne, so the ancestral size is INCLUDED here
+    (callers must NOT add a separate ancestral floor, and must set the present
+    size to the returned present_size, NOT to ancestral_ne).
+    """
+    eps = sorted(self.epochs, key=lambda e: e.slim_gen_start)
+    present_size = int(eps[-1].ne)
+    events = []
+    for i in range(1, len(eps)):
+        t_ago = self.sim_length - eps[i].slim_gen_start
+        if t_ago <= 0:
+            continue
+        events.append(
+            msprime.PopulationParametersChange(
+                time=t_ago,
+                initial_size=eps[i - 1].ne,   # OLDER neighbour
+                population=0,
             )
-        return events
+        )
+    return present_size, events
 
     def __repr__(self):
         return (f"MSMCDemography(n_epochs={len(self.epochs)}, "
@@ -685,3 +691,4 @@ class CoverageMask:
         hi = np.minimum(ends, end)
         overlap = np.clip(hi - lo, 0, None).sum()
         return float(overlap) / float(end - start)
+
